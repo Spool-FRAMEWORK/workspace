@@ -237,11 +237,16 @@ def render(plan: Plan, markdown: bool = False) -> str:
 class ReleaseFailed(Exception):
     """The release of a module cannot go on. Nothing that depends on it is released after this."""
 
+    def __init__(self, message: str, excerpt: str = ""):
+        super().__init__(message)
+        self.excerpt = excerpt
+
 
 @dataclass
 class Run:
     conclusion: str
     url: str
+    excerpt: str = ""           # the error lines of the log, when the run did not succeed
 
 
 @dataclass
@@ -251,6 +256,26 @@ class Result:
     outcome: str                # released, failed or not attempted
     detail: str = ""
     seconds: float = 0.0
+    excerpt: str = ""
+
+
+_LOG_PREFIX = re.compile(r"^[^\t]*\t[^\t]*\t\S+Z ?")
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_EXCEPTION = re.compile(r"^[\w.$]+(Exception|Error):")
+
+
+def error_lines(log: str, limit: int = 15) -> str:
+    """The last error lines of the log of a failed run, without the job, step and time gh puts in front.
+
+    Those are the lines Maven marks as errors and the ones that start with an exception, which is where
+    the reason is when Maven only says that a goal failed."""
+    kept = []
+    for line in log.splitlines():
+        line = _ANSI.sub("", _LOG_PREFIX.sub("", line)).replace("##[error]", "[ERROR] ").strip()
+        wanted = (line.startswith("[ERROR]") and line != "[ERROR]") or _EXCEPTION.match(line)
+        if wanted and (not kept or kept[-1] != line):
+            kept.append(line)
+    return "\n".join(kept[-limit:])
 
 
 def wait_until(condition: Callable[[], bool], timeout: float, clock: Callable[[], float] = time.monotonic,
@@ -288,7 +313,7 @@ def release(plan: Plan, ops, run_timeout: float = 45 * 60, central_timeout: floa
             if run is None:
                 raise ReleaseFailed(f"the release workflow did not finish in {int(run_timeout // 60)} minutes")
             if run.conclusion != "success":
-                raise ReleaseFailed(f"the release workflow ended as {run.conclusion}: {run.url}")
+                raise ReleaseFailed(f"the release workflow ended as {run.conclusion}: {run.url}", run.excerpt)
             log("   workflow finished, waiting for Central to show the version")
             if not wait_until(lambda: ops.on_central(entry.module, entry.base), central_timeout, clock, sleep):
                 raise ReleaseFailed(f"Central does not show {entry.base} after {int(central_timeout // 60)} minutes")
@@ -297,8 +322,10 @@ def release(plan: Plan, ops, run_timeout: float = 45 * 60, central_timeout: floa
             results.append(Result(entry.module, entry.tag, "released", run.url, clock() - started))
             log(f"   released in {(clock() - started) / 60:.1f} minutes")
         except ReleaseFailed as error:
-            results.append(Result(entry.module, entry.tag, "failed", str(error), clock() - started))
+            results.append(Result(entry.module, entry.tag, "failed", str(error), clock() - started, error.excerpt))
             log(f"   STOPPED: {error}")
+            for line in error.excerpt.splitlines():
+                log(f"      {line}")
             stopped = True
     return results
 
@@ -306,6 +333,16 @@ def release(plan: Plan, ops, run_timeout: float = 45 * 60, central_timeout: floa
 def render_results(results: list[Result], markdown: bool = False) -> str:
     rows = [(r.module, r.tag, r.outcome, f"{r.seconds / 60:.1f}" if r.seconds else "", r.detail) for r in results]
     return "\n".join(_table(("Module", "Tag", "Outcome", "Minutes", "Detail"), rows, markdown))
+
+
+def render_excerpts(results: list[Result], markdown: bool = False) -> str:
+    """The error lines of every module that failed, or nothing when none has any."""
+    blocks = []
+    for result in results:
+        if result.excerpt:
+            body = f"```\n{result.excerpt}\n```" if markdown else result.excerpt
+            blocks.append(f"{result.module} {result.tag}\n{body}")
+    return "\n\n".join(blocks)
 
 
 def _epoch(timestamp: str) -> float:
@@ -366,7 +403,13 @@ class GitHubOps:
 
         if not wait_until(finished, timeout, self._clock, self._sleep, first=30):
             return None
-        return Run(final["conclusion"], final["url"])
+        excerpt = "" if final["conclusion"] == "success" else self._failure_excerpt(repo)
+        return Run(final["conclusion"], final["url"], excerpt)
+
+    def _failure_excerpt(self, repo: str) -> str:
+        """Best effort: not being able to read the log must not hide that the run failed."""
+        result = self._gh("run", "view", str(self._run_id), "-R", repo, "--log-failed")
+        return error_lines(result.stdout) if result.returncode == 0 else ""
 
     def on_central(self, module: str, version: str) -> bool:
         base = f"{CENTRAL}/{GROUP_PATH}/{module}/{version}/{module}-{version}"
@@ -443,6 +486,9 @@ def command_run(args: argparse.Namespace) -> int:
     results = release(plan, GitHubOps(), args.run_timeout * 60, args.central_timeout * 60)
     print("\n" + render_results(results))
     append_summary(args.summary, "Release result", render_results(results, markdown=True))
+    if render_excerpts(results):
+        print("\n" + render_excerpts(results))
+        append_summary(args.summary, "Errors", render_excerpts(results, markdown=True))
     return 0 if all(r.outcome == "released" for r in results) else 1
 
 

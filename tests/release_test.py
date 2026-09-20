@@ -205,7 +205,9 @@ class FakeOps:
         outcome = self.fail_at.get(module)
         if outcome == "timeout":
             return None
-        return release.Run("failure" if outcome == "workflow" else "success", f"https://runs/{module}")
+        if outcome == "workflow":
+            return release.Run("failure", f"https://runs/{module}", "[ERROR] Failed to execute goal deploy")
+        return release.Run("success", f"https://runs/{module}")
 
     def on_central(self, module, version):
         self._asked[module] = self._asked.get(module, 0) + 1
@@ -419,8 +421,10 @@ class GitHubOpsTest(unittest.TestCase):
 
         class Gh(FakeGh):
             def __call__(self, command, **kwargs):
-                if command[:3] == ["gh", "run", "view"]:
+                if command[:3] == ["gh", "run", "view"] and "--json" in command:
                     return Completed(json.dumps(next(states)))
+                if command[:3] == ["gh", "run", "view"]:
+                    return Completed(returncode=1)         # the log of the failed run
                 return super().__call__(command, **kwargs)
 
         ops, _ = github_ops(Gh((["gh", "workflow"], Completed()), (["gh", "run", "list"], Completed(listing))),
@@ -464,6 +468,101 @@ class OutputsTest(unittest.TestCase):
 
     def test_nothing_is_written_when_no_file_is_given(self):
         release.write_outputs(None, release.build_plan(MODULES, world(after_the_bump())))
+
+
+# Lines as gh prints them for a failed step: job, step and time in front of each one.
+FAILED_LOG = "\n".join([
+    "release / publish\tUNKNOWN STEP\t2026-09-20T17:19:59.8111103Z [WARNING] public Janitor(JanitorStrategy strategy) {",
+    "release / publish\tUNKNOWN STEP\t2026-09-20T17:20:11.3471477Z [ERROR] Unable to upload bundle for deployment: Deployment",
+    "release / publish\tUNKNOWN STEP\t2026-09-20T17:20:11.3473968Z java.lang.RuntimeException: Invalid request. Status: 401",
+    "release / publish\tUNKNOWN STEP\t2026-09-20T17:20:11.3551966Z [INFO] BUILD FAILURE",
+    "release / publish\tUNKNOWN STEP\t2026-09-20T17:20:11.3559854Z [ERROR] Failed to execute goal central-publishing-maven-plugin:0.7.0:publish",
+    "release / publish\tUNKNOWN STEP\t2026-09-20T17:20:11.3562895Z [ERROR] ",
+    "release / publish\tUNKNOWN STEP\t2026-09-20T17:20:11.3564032Z [ERROR] To see the full stack trace, re-run Maven with the -e switch.",
+    "release / publish\tUNKNOWN STEP\t2026-09-20T17:20:11.3566311Z ##[error]Process completed with exit code 1.",
+])
+
+
+class ErrorLinesTest(unittest.TestCase):
+    def test_keeps_only_the_error_lines_without_what_gh_puts_in_front(self):
+        self.assertEqual(release.error_lines(FAILED_LOG).splitlines(), [
+            "[ERROR] Unable to upload bundle for deployment: Deployment",
+            "java.lang.RuntimeException: Invalid request. Status: 401",
+            "[ERROR] Failed to execute goal central-publishing-maven-plugin:0.7.0:publish",
+            "[ERROR] To see the full stack trace, re-run Maven with the -e switch.",
+            "[ERROR] Process completed with exit code 1.",
+        ])
+
+    def test_only_the_last_lines_are_kept_when_there_are_many(self):
+        log = "\n".join(f"job\tstep\t2026-09-20T17:00:00.0000000Z [ERROR] line {n}" for n in range(30))
+
+        self.assertEqual(release.error_lines(log, limit=3).splitlines(), ["[ERROR] line 27", "[ERROR] line 28", "[ERROR] line 29"])
+
+    def test_a_log_without_errors_gives_nothing(self):
+        self.assertEqual(release.error_lines("job\tstep\t2026-09-20T17:00:00.0000000Z all fine"), "")
+
+
+class FailureExcerptTest(unittest.TestCase):
+    def failed_run(self, log_reply):
+        clock = FakeClock()
+        clock.now = 1_000_000.0
+        listing = json.dumps([{"databaseId": 9, "createdAt": datetime_of(1_000_001.0)}])
+        view = json.dumps({"status": "completed", "conclusion": "failure", "url": "https://runs/9"})
+        gh = FakeGh((["gh", "workflow"], Completed()), (["gh", "run", "list"], Completed(listing)),
+                    (["gh", "run", "view", "9", "-R", "Spool-FRAMEWORK/janitor", "--json"], Completed(view)),
+                    (["gh", "run", "view", "9", "-R", "Spool-FRAMEWORK/janitor", "--log-failed"], log_reply))
+        ops, _ = github_ops(gh, clock=clock)
+        ops.dispatch("janitor", "v1.2.1")
+        return ops.wait_for_run("janitor", 3600)
+
+    def test_a_failed_run_comes_with_its_error_lines(self):
+        run = self.failed_run(Completed(FAILED_LOG))
+
+        self.assertEqual(run.conclusion, "failure")
+        self.assertIn("[ERROR] Unable to upload bundle for deployment: Deployment", run.excerpt)
+
+    def test_a_log_that_cannot_be_read_does_not_hide_the_failure(self):
+        run = self.failed_run(Completed(stderr="log expired", returncode=1))
+
+        self.assertEqual((run.conclusion, run.excerpt), ("failure", ""))
+
+    def test_a_successful_run_does_not_ask_for_the_log(self):
+        clock = FakeClock()
+        clock.now = 1_000_000.0
+        listing = json.dumps([{"databaseId": 9, "createdAt": datetime_of(1_000_001.0)}])
+        view = json.dumps({"status": "completed", "conclusion": "success", "url": "u"})
+        gh = FakeGh((["gh", "workflow"], Completed()), (["gh", "run", "list"], Completed(listing)),
+                    (["gh", "run", "view"], Completed(view)))
+        ops, _ = github_ops(gh, clock=clock)
+        ops.dispatch("janitor", "v1.2.1")
+
+        ops.wait_for_run("janitor", 3600)
+
+        self.assertNotIn("--log-failed", [arg for command in gh.commands for arg in command])
+
+
+class ExcerptReportTest(unittest.TestCase):
+    def test_the_error_lines_of_a_failed_module_end_up_in_its_result_and_in_the_report(self):
+        results, _ = run_release(FakeOps(fail_at={"janitor": "workflow"}))
+
+        self.assertEqual(results[0].excerpt, "[ERROR] Failed to execute goal deploy")
+        self.assertIn("janitor v1.2.1\n[ERROR] Failed to execute goal deploy", release.render_excerpts(results))
+        self.assertIn("```", release.render_excerpts(results, markdown=True))
+
+    def test_the_error_lines_are_logged_when_the_release_stops(self):
+        lines = []
+        plan = release.build_plan(MODULES, world(after_the_bump()))
+        clock = FakeClock()
+
+        release.release(plan, FakeOps(fail_at={"janitor": "workflow"}), log=lines.append, clock=clock,
+                        sleep=clock.sleep)
+
+        self.assertIn("      [ERROR] Failed to execute goal deploy", lines)
+
+    def test_there_is_no_report_when_nothing_failed(self):
+        results, _ = run_release(FakeOps())
+
+        self.assertEqual(release.render_excerpts(results), "")
 
 
 if __name__ == "__main__":
