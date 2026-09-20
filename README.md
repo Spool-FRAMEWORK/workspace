@@ -124,6 +124,12 @@ Actions, pick **Release** and run it.
 3. The first failure stops the release. The modules that come after it are reported as not attempted, and the table at
    the end of the run shows how long each step took.
 
+Open the log of the **Release** job while it runs to follow it. It starts with a checklist of the modules
+(`[x]` done, `[>]` in progress, `[!]` failed, `[ ]` to do), shows it again each time a module starts or ends, and while
+it waits it prints what it waits for, how long that module has taken and about how many minutes are left. The estimate
+uses the pace of the modules already released in that run, and at the start a usual time of 16 minutes per module, most
+of which is Central taking a while to show the version.
+
 Nothing is waited for by guessing a time, it is polled with a growing pause. The same plan is available locally, and it
 only reads public data:
 
