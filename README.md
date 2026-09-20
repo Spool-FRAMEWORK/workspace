@@ -109,6 +109,33 @@ force the part that grows in the dependents. Nothing is committed: review and co
 `bump.sh` needs a POSIX shell, so on Windows use Git Bash or WSL. CI runs `./bump.sh --check` to catch versions that
 drift apart.
 
+## Releases
+
+Releasing is done by GitHub Actions, not from anybody's machine, so it works the same for every developer. Go to
+Actions, pick **Release** and run it.
+
+1. The plan is the first job and it is also what a dry run shows (`dry_run` is on by default). A module is pending when
+   the version of its `pom.xml` on `main`, without `-SNAPSHOT`, is not on Maven Central. The modules come out in
+   dependency order, and a dependency on a version that is neither on Central nor released earlier in the plan is
+   reported as a problem that stops the release.
+2. Run it again with `dry_run` off. The reviewers of the `release` environment approve it, then each pending module in
+   turn gets its own release workflow started, and the next one does not start until three things are true: the workflow
+   finished successfully, Central shows the version, and Maven can resolve it from Central alone the way a consumer would.
+3. The first failure stops the release. The modules that come after it are reported as not attempted, and the table at
+   the end of the run shows how long each step took.
+
+Nothing is waited for by guessing a time, it is polled with a growing pause. The same plan is available locally, and it
+only reads public data:
+
+```bash
+python3 tools/release.py plan
+```
+
+To release, merge `develop` into `main` in each module that changed, then run the workflow. `release.py run` needs
+`GH_TOKEN` to hold a token that can start workflows in the module repositories, which in the workflow is the
+`RELEASE_TOKEN` secret. Publishing to Central cannot be undone, so a failed run is fixed by bumping the version and
+releasing again, never by releasing the same one twice.
+
 ## Working in an IDE
 
 Open `pom.xml` from this repository as a Maven project. The ten modules are imported together, so you can navigate and
