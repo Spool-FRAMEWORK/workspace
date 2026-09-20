@@ -94,3 +94,14 @@ jobs:
       - name: Build and run the tests of every module
         working-directory: workspace
         run: sh ./build.sh --tests
+
+  release-tool:
+    name: Release tool tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test the release tool
+        run: python3 -m unittest discover -s tests -p "*_test.py"
