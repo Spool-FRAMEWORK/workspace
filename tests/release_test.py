@@ -187,15 +187,22 @@ class RenderTest(unittest.TestCase):
 class FakeOps:
     """Stands in for GitHub and Central. Each module can be told to fail at one step."""
 
-    def __init__(self, fail_at=None, existing_tags=(), central_after=0):
+    def __init__(self, fail_at=None, tags=None, central_after=0, running=()):
         self.fail_at = fail_at or {}
-        self.existing_tags = set(existing_tags)
+        self.tags = tags or {}                 # tag -> version of the pom it points at
+        self.busy = set(running)               # modules with a release workflow in progress
         self.central_after = central_after     # how many times Central says no before it says yes
         self.calls = []
         self._asked = {}
 
     def tag_exists(self, module, tag):
-        return tag in self.existing_tags
+        return tag in self.tags
+
+    def tag_version(self, module, tag):
+        return self.tags[tag]
+
+    def running(self, module):
+        return module in self.busy
 
     def dispatch(self, module, tag):
         self.calls.append(("dispatch", module, tag))
@@ -316,13 +323,35 @@ class ReleaseTest(unittest.TestCase):
         self.assertEqual([r.outcome for r in results], ["released", "released", "failed", "not attempted"])
         self.assertIn("cannot be resolved", results[2].detail)
 
-    def test_a_tag_that_already_exists_is_never_dispatched_over(self):
-        ops = FakeOps(existing_tags={"v1.2.1"})
+    def test_a_tag_that_holds_another_version_is_never_released_over(self):
+        ops = FakeOps(tags={"v1.2.1": "1.2.0"})
 
         results, _ = run_release(ops)
 
         self.assertEqual(results[0].outcome, "failed")
-        self.assertIn("already exists", results[0].detail)
+        self.assertIn("exists but holds version 1.2.0, not 1.2.1", results[0].detail)
+        self.assertEqual([c for c in ops.calls if c[0] == "dispatch"], [])
+        self.assertEqual([r.outcome for r in results[1:]], ["not attempted"] * 3)
+
+    def test_a_release_that_failed_after_creating_the_tag_is_released_again(self):
+        ops = FakeOps(tags={"v1.2.1": "1.2.1"})
+        lines = []
+        plan = release.build_plan(MODULES, world(after_the_bump()))
+        clock = FakeClock()
+
+        results = release.release(plan, ops, log=lines.append, clock=clock, sleep=clock.sleep)
+
+        self.assertEqual([r.outcome for r in results], ["released"] * 4)
+        self.assertIn(("dispatch", "janitor", "v1.2.1"), ops.calls)
+        self.assertTrue(any("exists but 1.2.1 is not on Central" in line for line in lines))
+
+    def test_a_release_already_running_is_not_started_a_second_time(self):
+        ops = FakeOps(tags={"v1.2.1": "1.2.1"}, running={"janitor"})
+
+        results, _ = run_release(ops)
+
+        self.assertEqual(results[0].outcome, "failed")
+        self.assertIn("already running", results[0].detail)
         self.assertEqual([c for c in ops.calls if c[0] == "dispatch"], [])
 
     def test_the_time_of_each_module_is_recorded(self):
@@ -364,21 +393,58 @@ def github_ops(gh, exists=lambda url: True, clock=None):
 
 
 class GitHubOpsTest(unittest.TestCase):
-    def test_a_missing_tag_is_told_apart_from_a_failed_call(self):
-        ops, _ = github_ops(FakeGh((["gh", "api"], Completed(stderr="gh: Not Found (HTTP 404)", returncode=1))))
+    def test_a_missing_tag_is_an_empty_answer(self):
+        ops, _ = github_ops(FakeGh((["gh", "api"], Completed("[]"))))
 
         self.assertFalse(ops.tag_exists("janitor", "v1.2.1"))
 
     def test_an_existing_tag_is_found(self):
-        ops, _ = github_ops(FakeGh((["gh", "api"], Completed(stdout="{}"))))
+        gh = FakeGh((["gh", "api"], Completed('[{"ref": "refs/tags/v1.2.1"}]')))
+        ops, _ = github_ops(gh)
 
         self.assertTrue(ops.tag_exists("janitor", "v1.2.1"))
+        self.assertIn("repos/Spool-FRAMEWORK/janitor/git/matching-refs/tags/v1.2.1", gh.commands[0])
 
-    def test_a_failed_call_is_not_taken_for_a_missing_tag(self):
-        ops, _ = github_ops(FakeGh((["gh", "api"], Completed(stderr="HTTP 401: Bad credentials", returncode=1))))
+    def test_a_tag_that_only_starts_the_same_is_not_the_tag(self):
+        ops, _ = github_ops(FakeGh((["gh", "api"], Completed('[{"ref": "refs/tags/v1.2.10"}]'))))
+
+        self.assertFalse(ops.tag_exists("janitor", "v1.2.1"))
+
+    def test_a_failed_call_is_never_taken_for_a_missing_tag_whatever_it_says(self):
+        for stderr in ("HTTP 401: Bad credentials", "gh: Not Found (HTTP 404)", ""):
+            ops, _ = github_ops(FakeGh((["gh", "api"], Completed(stderr=stderr, returncode=1))))
+
+            with self.assertRaises(release.ReleaseFailed):
+                ops.tag_exists("janitor", "v1.2.1")
+
+    def test_the_version_at_a_tag_is_read_from_its_pom_without_snapshot(self):
+        gh = FakeGh((["gh", "api"], Completed(pom("janitor", "1.2.1-SNAPSHOT", ("core", "1.2.0")))))
+        ops, _ = github_ops(gh)
+
+        self.assertEqual(ops.tag_version("janitor", "v1.2.1"), "1.2.1")
+        self.assertIn("repos/Spool-FRAMEWORK/janitor/contents/pom.xml?ref=v1.2.1", gh.commands[0])
+
+    def test_a_pom_that_cannot_be_read_at_a_tag_stops_the_release(self):
+        ops, _ = github_ops(FakeGh((["gh", "api"], Completed(returncode=1))))
 
         with self.assertRaises(release.ReleaseFailed):
-            ops.tag_exists("janitor", "v1.2.1")
+            ops.tag_version("janitor", "v1.2.1")
+
+    def test_a_pom_without_a_version_at_a_tag_stops_the_release(self):
+        ops, _ = github_ops(FakeGh((["gh", "api"], Completed("<project/>"))))
+
+        with self.assertRaises(release.ReleaseFailed):
+            ops.tag_version("janitor", "v1.2.1")
+
+    def test_a_workflow_is_running_when_one_is_queued_or_in_progress(self):
+        queued = FakeGh((["gh", "run", "list", "-R", "Spool-FRAMEWORK/janitor", "--workflow", "release.yml",
+                          "--status", "queued"], Completed("[]")),
+                        (["gh", "run", "list", "-R", "Spool-FRAMEWORK/janitor", "--workflow", "release.yml",
+                          "--status", "in_progress"], Completed('[{"databaseId": 5}]')))
+        idle = FakeGh((["gh", "run", "list"], Completed("[]")))
+
+        self.assertTrue(github_ops(queued)[0].running("janitor"))
+        self.assertFalse(github_ops(idle)[0].running("janitor"))
 
     def test_dispatch_runs_the_release_workflow_of_the_module_on_main_with_the_tag(self):
         gh = FakeGh((["gh", "workflow"], Completed()))

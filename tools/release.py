@@ -306,7 +306,14 @@ def release(plan: Plan, ops, run_timeout: float = 45 * 60, central_timeout: floa
         try:
             log(f"== {entry.module} {entry.tag}")
             if ops.tag_exists(entry.module, entry.tag):
-                raise ReleaseFailed(f"the tag {entry.tag} already exists")
+                # A release that failed after creating the tag, before reaching Central. The version is
+                # not burned, so it can be released again as long as the tag holds what the plan expects.
+                held = ops.tag_version(entry.module, entry.tag)
+                if held != entry.base:
+                    raise ReleaseFailed(f"the tag {entry.tag} exists but holds version {held}, not {entry.base}")
+                if ops.running(entry.module):
+                    raise ReleaseFailed("a release workflow of this module is already running")
+                log(f"   the tag {entry.tag} exists but {entry.base} is not on Central: releasing it again")
             ops.dispatch(entry.module, entry.tag)
             log("   release workflow started, waiting for it to finish")
             run = ops.wait_for_run(entry.module, run_timeout)
@@ -367,12 +374,29 @@ class GitHubOps:
         return json.loads(result.stdout)
 
     def tag_exists(self, module: str, tag: str) -> bool:
-        result = self._gh("api", f"repos/{ORG}/{module}/git/ref/tags/{tag}")
-        if result.returncode == 0:
-            return True
-        if "404" in result.stderr or "Not Found" in result.stderr:
-            return False
-        raise ReleaseFailed(f"cannot check whether the tag exists: {result.stderr.strip()}")
+        # matching-refs answers with a list, empty when there is nothing, so a failed call is always a
+        # real error and the exit code is enough. It matches by prefix, hence the exact comparison.
+        refs = self._json("api", f"repos/{ORG}/{module}/git/matching-refs/tags/{tag}")
+        return any(ref["ref"] == f"refs/tags/{tag}" for ref in refs)
+
+    def tag_version(self, module: str, tag: str) -> str:
+        """The version, without -SNAPSHOT, in the pom.xml the tag points at."""
+        result = self._gh("api", f"repos/{ORG}/{module}/contents/pom.xml?ref={tag}",
+                          "-H", "Accept: application/vnd.github.raw")
+        if result.returncode != 0:
+            raise ReleaseFailed(f"cannot read the pom.xml at tag {tag}: {result.stderr.strip()}")
+        try:
+            return base_version(parse_pom(result.stdout)[1])
+        except ValueError as error:
+            raise ReleaseFailed(f"cannot read the version at tag {tag}: {error}")
+
+    def running(self, module: str) -> bool:
+        """Whether a release workflow of the module is queued or in progress."""
+        for status in ("queued", "in_progress"):
+            if self._json("run", "list", "-R", f"{ORG}/{module}", "--workflow", "release.yml",
+                          "--status", status, "--json", "databaseId"):
+                return True
+        return False
 
     def dispatch(self, module: str, tag: str) -> None:
         self._dispatched_at = self._clock()
