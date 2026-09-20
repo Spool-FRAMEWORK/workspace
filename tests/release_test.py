@@ -1,4 +1,5 @@
 """Tests for tools/release.py. Run them with: python3 -m unittest discover -s tests -p "*_test.py" """
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -181,6 +182,273 @@ class RenderTest(unittest.TestCase):
         text = release.render(release.build_plan(MODULES, world(after_the_bump())), markdown=True)
 
         self.assertTrue(text.startswith("| Order | Module | Version on main | Tag | State |"))
+
+
+class FakeOps:
+    """Stands in for GitHub and Central. Each module can be told to fail at one step."""
+
+    def __init__(self, fail_at=None, existing_tags=(), central_after=0):
+        self.fail_at = fail_at or {}
+        self.existing_tags = set(existing_tags)
+        self.central_after = central_after     # how many times Central says no before it says yes
+        self.calls = []
+        self._asked = {}
+
+    def tag_exists(self, module, tag):
+        return tag in self.existing_tags
+
+    def dispatch(self, module, tag):
+        self.calls.append(("dispatch", module, tag))
+
+    def wait_for_run(self, module, timeout):
+        self.calls.append(("wait", module))
+        outcome = self.fail_at.get(module)
+        if outcome == "timeout":
+            return None
+        return release.Run("failure" if outcome == "workflow" else "success", f"https://runs/{module}")
+
+    def on_central(self, module, version):
+        self._asked[module] = self._asked.get(module, 0) + 1
+        self.calls.append(("central", module))
+        return self._asked[module] > self.central_after
+
+    def resolves(self, module, version):
+        self.calls.append(("resolves", module))
+        return self.fail_at.get(module) != "resolve"
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+        self.slept = []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+def run_release(ops, main=None, **options):
+    clock = FakeClock()
+    plan = release.build_plan(MODULES, world(main or after_the_bump()))
+    results = release.release(plan, ops, log=lambda _: None, clock=clock, sleep=clock.sleep, **options)
+    return results, clock
+
+
+class WaitUntilTest(unittest.TestCase):
+    def test_returns_as_soon_as_the_condition_holds(self):
+        clock = FakeClock()
+
+        self.assertTrue(release.wait_until(lambda: True, 100, clock, clock.sleep))
+        self.assertEqual(clock.slept, [])
+
+    def test_waits_a_little_longer_each_time_up_to_a_cap(self):
+        clock, answers = FakeClock(), iter([False] * 6 + [True])
+
+        self.assertTrue(release.wait_until(lambda: next(answers), 10_000, clock, clock.sleep,
+                                           first=20, factor=2, cap=100))
+        self.assertEqual(clock.slept, [20, 40, 80, 100, 100, 100])
+
+    def test_gives_up_when_the_time_is_over(self):
+        clock = FakeClock()
+
+        self.assertFalse(release.wait_until(lambda: False, 100, clock, clock.sleep, first=60))
+        self.assertLessEqual(clock.now, 100)
+
+
+class ReleaseTest(unittest.TestCase):
+    def test_releases_every_pending_module_in_order(self):
+        ops = FakeOps()
+
+        results, _ = run_release(ops)
+
+        self.assertEqual([r.module for r in results], ["janitor", "infrastructure", "dsl", "runtime"])
+        self.assertTrue(all(r.outcome == "released" for r in results))
+        self.assertEqual([c[1] for c in ops.calls if c[0] == "dispatch"],
+                         ["janitor", "infrastructure", "dsl", "runtime"])
+
+    def test_each_module_is_checked_before_the_next_one_starts(self):
+        ops = FakeOps()
+
+        run_release(ops)
+
+        janitor_done = ops.calls.index(("resolves", "janitor"))
+        infrastructure_start = ops.calls.index(("dispatch", "infrastructure", "v1.2.1"))
+        self.assertLess(janitor_done, infrastructure_start)
+
+    def test_a_failed_workflow_stops_everything_after_it(self):
+        ops = FakeOps(fail_at={"infrastructure": "workflow"})
+
+        results, _ = run_release(ops)
+
+        self.assertEqual([r.outcome for r in results], ["released", "failed", "not attempted", "not attempted"])
+        self.assertIn("https://runs/infrastructure", results[1].detail)
+        self.assertNotIn("dsl", [c[1] for c in ops.calls if c[0] == "dispatch"])
+
+    def test_a_workflow_that_never_finishes_stops_the_release(self):
+        results, _ = run_release(FakeOps(fail_at={"janitor": "timeout"}))
+
+        self.assertEqual(results[0].outcome, "failed")
+        self.assertIn("did not finish", results[0].detail)
+        self.assertEqual([r.outcome for r in results[1:]], ["not attempted"] * 3)
+
+    def test_a_version_that_never_reaches_central_stops_the_release(self):
+        results, _ = run_release(FakeOps(central_after=10 ** 6), central_timeout=600)
+
+        self.assertEqual(results[0].outcome, "failed")
+        self.assertIn("Central does not show 1.2.1", results[0].detail)
+
+    def test_it_waits_for_central_instead_of_giving_up_at_the_first_no(self):
+        ops = FakeOps(central_after=3)
+
+        results, clock = run_release(ops)
+
+        self.assertEqual(results[0].outcome, "released")
+        self.assertGreater(clock.now, 0)
+
+    def test_a_version_that_cannot_be_resolved_stops_the_release(self):
+        results, _ = run_release(FakeOps(fail_at={"dsl": "resolve"}))
+
+        self.assertEqual([r.outcome for r in results], ["released", "released", "failed", "not attempted"])
+        self.assertIn("cannot be resolved", results[2].detail)
+
+    def test_a_tag_that_already_exists_is_never_dispatched_over(self):
+        ops = FakeOps(existing_tags={"v1.2.1"})
+
+        results, _ = run_release(ops)
+
+        self.assertEqual(results[0].outcome, "failed")
+        self.assertIn("already exists", results[0].detail)
+        self.assertEqual([c for c in ops.calls if c[0] == "dispatch"], [])
+
+    def test_the_time_of_each_module_is_recorded(self):
+        results, _ = run_release(FakeOps(central_after=2))
+
+        self.assertGreater(results[0].seconds, 0)
+
+    def test_the_result_table_shows_what_was_not_attempted(self):
+        results, _ = run_release(FakeOps(fail_at={"janitor": "workflow"}))
+
+        text = release.render_results(results)
+
+        self.assertIn("failed", text)
+        self.assertEqual(text.count("not attempted"), 3)
+
+
+class Completed:
+    def __init__(self, stdout="", stderr="", returncode=0):
+        self.stdout, self.stderr, self.returncode = stdout, stderr, returncode
+
+
+class FakeGh:
+    """Answers the gh and mvn commands GitHubOps runs, from a list of (prefix, reply)."""
+
+    def __init__(self, *replies):
+        self.replies, self.commands = list(replies), []
+
+    def __call__(self, command, **_):
+        self.commands.append(command)
+        for prefix, reply in self.replies:
+            if command[: len(prefix)] == prefix:
+                return reply
+        raise AssertionError(f"unexpected command {command}")
+
+
+def github_ops(gh, exists=lambda url: True, clock=None):
+    clock = clock or FakeClock()
+    return release.GitHubOps(run=gh, exists=exists, clock=clock, sleep=clock.sleep), clock
+
+
+class GitHubOpsTest(unittest.TestCase):
+    def test_a_missing_tag_is_told_apart_from_a_failed_call(self):
+        ops, _ = github_ops(FakeGh((["gh", "api"], Completed(stderr="gh: Not Found (HTTP 404)", returncode=1))))
+
+        self.assertFalse(ops.tag_exists("janitor", "v1.2.1"))
+
+    def test_an_existing_tag_is_found(self):
+        ops, _ = github_ops(FakeGh((["gh", "api"], Completed(stdout="{}"))))
+
+        self.assertTrue(ops.tag_exists("janitor", "v1.2.1"))
+
+    def test_a_failed_call_is_not_taken_for_a_missing_tag(self):
+        ops, _ = github_ops(FakeGh((["gh", "api"], Completed(stderr="HTTP 401: Bad credentials", returncode=1))))
+
+        with self.assertRaises(release.ReleaseFailed):
+            ops.tag_exists("janitor", "v1.2.1")
+
+    def test_dispatch_runs_the_release_workflow_of_the_module_on_main_with_the_tag(self):
+        gh = FakeGh((["gh", "workflow"], Completed()))
+        ops, _ = github_ops(gh)
+
+        ops.dispatch("janitor", "v1.2.1")
+
+        self.assertEqual(gh.commands[0], ["gh", "workflow", "run", "release.yml", "-R", "Spool-FRAMEWORK/janitor",
+                                          "--ref", "main", "-f", "tag=v1.2.1"])
+
+    def test_a_dispatch_that_gh_rejects_stops_the_release(self):
+        ops, _ = github_ops(FakeGh((["gh", "workflow"], Completed(stderr="no workflow", returncode=1))))
+
+        with self.assertRaises(release.ReleaseFailed):
+            ops.dispatch("janitor", "v1.2.1")
+
+    def test_it_follows_the_run_started_by_its_own_dispatch_and_not_an_older_one(self):
+        clock = FakeClock()
+        clock.now = 1_000_000.0
+        old = "1970-01-01T00:00:00Z"
+        new = datetime_of(1_000_005.0)
+        listing = json.dumps([{"databaseId": 1, "createdAt": old}, {"databaseId": 2, "createdAt": new}])
+        view = json.dumps({"status": "completed", "conclusion": "success", "url": "https://runs/2"})
+        gh = FakeGh((["gh", "workflow"], Completed()), (["gh", "run", "list"], Completed(listing)),
+                    (["gh", "run", "view"], Completed(view)))
+        ops, _ = github_ops(gh, clock=clock)
+
+        ops.dispatch("janitor", "v1.2.1")
+        run = ops.wait_for_run("janitor", 3600)
+
+        self.assertEqual(run, release.Run("success", "https://runs/2"))
+        self.assertEqual(gh.commands[-1][:4], ["gh", "run", "view", "2"])
+
+    def test_it_keeps_asking_while_the_run_is_in_progress(self):
+        clock = FakeClock()
+        clock.now = 1_000_000.0
+        listing = json.dumps([{"databaseId": 7, "createdAt": datetime_of(1_000_001.0)}])
+        states = iter([{"status": "queued"}, {"status": "in_progress"},
+                       {"status": "completed", "conclusion": "failure", "url": "u"}])
+
+        class Gh(FakeGh):
+            def __call__(self, command, **kwargs):
+                if command[:3] == ["gh", "run", "view"]:
+                    return Completed(json.dumps(next(states)))
+                return super().__call__(command, **kwargs)
+
+        ops, _ = github_ops(Gh((["gh", "workflow"], Completed()), (["gh", "run", "list"], Completed(listing))),
+                            clock=clock)
+        ops.dispatch("janitor", "v1.2.1")
+
+        self.assertEqual(ops.wait_for_run("janitor", 3600), release.Run("failure", "u"))
+
+    def test_a_version_is_on_central_only_when_its_pom_and_its_jar_are(self):
+        seen = []
+        ops, _ = github_ops(FakeGh(), exists=lambda url: seen.append(url) or url.endswith(".pom"))
+
+        self.assertFalse(ops.on_central("janitor", "1.2.1"))
+        self.assertEqual(seen[0], "https://repo1.maven.org/maven2/io/github/spool-framework/janitor/1.2.1/janitor-1.2.1.pom")
+
+    def test_resolving_uses_a_settings_file_that_sends_everything_to_central(self):
+        gh = FakeGh((["mvn"], Completed()))
+        ops, _ = github_ops(gh)
+
+        self.assertTrue(ops.resolves("janitor", "1.2.1"))
+        command = gh.commands[0]
+        self.assertIn("-Dartifact=io.github.spool-framework:janitor:1.2.1", command)
+        self.assertIn("-s", command)
+
+
+def datetime_of(epoch):
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 if __name__ == "__main__":

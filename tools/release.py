@@ -2,24 +2,36 @@
 """Plans, and runs, the release of the Spool modules to Maven Central.
 
     python3 tools/release.py plan       what would be released, in which order, and what is wrong
+    python3 tools/release.py run --yes  release every pending module, one after the other
 
 A module is pending when the base version of its pom on main, without -SNAPSHOT, is not on Central yet.
 Modules are ordered so that each one comes after the ones it depends on: a module published against a
 version that does not exist yet would be broken for good, because Central does not let a version be
 published again.
+
+Nothing is waited for by guessing a time. After starting the release workflow of a module it waits for
+the workflow to end, then for the version to appear on Central, then checks that it can be resolved the
+way a consumer would. If any of those fails, nothing that depends on the module is released.
 """
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import re
+import subprocess
 import sys
+import tempfile
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
 ORG = "Spool-FRAMEWORK"
+GROUP = "io.github.spool-framework"
 CENTRAL = "https://repo1.maven.org/maven2"
 GROUP_PATH = "io/github/spool-framework"
 RELEASE_BRANCH = "main"
@@ -27,6 +39,12 @@ DEVELOPMENT_BRANCH = "develop"
 
 # Modules that are not published to Maven Central, and why.
 NOT_ON_CENTRAL = {"watchdog": "it is published as a Docker image"}
+
+# Settings that send every repository to Central, so a version is resolved the way a consumer would.
+_CENTRAL_ONLY = (
+    "<settings><mirrors><mirror><id>central-only</id><mirrorOf>*</mirrorOf>"
+    f"<url>{CENTRAL}</url></mirror></mirrors></settings>"
+)
 
 _TRIPLET = re.compile(
     r"<groupId>io\.github\.spool-framework</groupId>\s*<artifactId>([^<]+)</artifactId>\s*<version>([^<]+)</version>"
@@ -72,10 +90,23 @@ def http_fetch(url: str) -> Optional[str]:
         raise
 
 
+def http_exists(url: str) -> bool:
+    request = urllib.request.Request(url, method="HEAD")
+    try:
+        with urllib.request.urlopen(request, timeout=30):
+            return True
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return False
+        raise
+
+
 def central_versions(module: str, fetch: Fetch) -> set[str]:
     metadata = fetch(metadata_url(module))
     return set(re.findall(r"<version>([^<]+)</version>", metadata)) if metadata else set()
 
+
+# --------------------------------------------------------------------------------------------- plan
 
 @dataclass
 class Entry:
@@ -169,12 +200,20 @@ def build_plan(modules: list[str], fetch: Fetch) -> Plan:
     return Plan(ordered)
 
 
+def _table(header: tuple, rows: list[tuple], markdown: bool) -> list[str]:
+    if markdown:
+        return (["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
+                + ["| " + " | ".join(str(cell) for cell in row) + " |" for row in rows])
+    widths = [max(len(str(cell)) for cell in column) for column in zip(header, *rows)]
+    return ["  ".join(str(cell).ljust(width) for cell, width in zip(row, widths)).rstrip()
+            for row in [header] + rows]
+
+
 def render(plan: Plan, markdown: bool = False) -> str:
     rows, position = [], 0
     for entry in plan.entries:
         if entry.skipped:
-            state = f"not released to Central ({entry.skipped})"
-            order = "-"
+            state, order = f"not released to Central ({entry.skipped})", "-"
         elif entry.pending:
             position += 1
             state, order = "PENDING", str(position)
@@ -182,16 +221,7 @@ def render(plan: Plan, markdown: bool = False) -> str:
             state, order = "already on Central", "-"
         rows.append((order, entry.module, entry.version, entry.tag if entry.pending else "", state))
 
-    header = ("Order", "Module", "Version on main", "Tag", "State")
-    lines = []
-    if markdown:
-        lines += ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
-        lines += ["| " + " | ".join(row) + " |" for row in rows]
-    else:
-        widths = [max(len(str(cell)) for cell in column) for column in zip(header, *rows)]
-        for row in [header] + rows:
-            lines.append("  ".join(str(cell).ljust(width) for cell, width in zip(row, widths)).rstrip())
-
+    lines = _table(("Order", "Module", "Version on main", "Tag", "State"), rows, markdown)
     if not plan.pending:
         lines += ["", "Nothing to release: every version on main is already on Central."]
     if plan.problems:
@@ -202,31 +232,231 @@ def render(plan: Plan, markdown: bool = False) -> str:
     return "\n".join(lines)
 
 
+# ------------------------------------------------------------------------------------------- release
+
+class ReleaseFailed(Exception):
+    """The release of a module cannot go on. Nothing that depends on it is released after this."""
+
+
+@dataclass
+class Run:
+    conclusion: str
+    url: str
+
+
+@dataclass
+class Result:
+    module: str
+    tag: str
+    outcome: str                # released, failed or not attempted
+    detail: str = ""
+    seconds: float = 0.0
+
+
+def wait_until(condition: Callable[[], bool], timeout: float, clock: Callable[[], float] = time.monotonic,
+               sleep: Callable[[float], None] = time.sleep, first: float = 20.0, factor: float = 1.5,
+               cap: float = 120.0) -> bool:
+    """Asks again and again, waiting a little longer each time, until it is true or the time is up."""
+    deadline, pause = clock() + timeout, first
+    while True:
+        if condition():
+            return True
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return False
+        sleep(min(pause, remaining))
+        pause = min(pause * factor, cap)
+
+
+def release(plan: Plan, ops, run_timeout: float = 45 * 60, central_timeout: float = 60 * 60,
+            log: Callable[[str], None] = print, clock: Callable[[], float] = time.monotonic,
+            sleep: Callable[[float], None] = time.sleep) -> list[Result]:
+    """Releases the pending modules in order and stops at the first one that fails."""
+    results, stopped = [], False
+    for entry in plan.pending:
+        if stopped:
+            results.append(Result(entry.module, entry.tag, "not attempted"))
+            continue
+        started = clock()
+        try:
+            log(f"== {entry.module} {entry.tag}")
+            if ops.tag_exists(entry.module, entry.tag):
+                raise ReleaseFailed(f"the tag {entry.tag} already exists")
+            ops.dispatch(entry.module, entry.tag)
+            log("   release workflow started, waiting for it to finish")
+            run = ops.wait_for_run(entry.module, run_timeout)
+            if run is None:
+                raise ReleaseFailed(f"the release workflow did not finish in {int(run_timeout // 60)} minutes")
+            if run.conclusion != "success":
+                raise ReleaseFailed(f"the release workflow ended as {run.conclusion}: {run.url}")
+            log("   workflow finished, waiting for Central to show the version")
+            if not wait_until(lambda: ops.on_central(entry.module, entry.base), central_timeout, clock, sleep):
+                raise ReleaseFailed(f"Central does not show {entry.base} after {int(central_timeout // 60)} minutes")
+            if not ops.resolves(entry.module, entry.base):
+                raise ReleaseFailed("it is on Central but cannot be resolved the way a consumer would")
+            results.append(Result(entry.module, entry.tag, "released", run.url, clock() - started))
+            log(f"   released in {(clock() - started) / 60:.1f} minutes")
+        except ReleaseFailed as error:
+            results.append(Result(entry.module, entry.tag, "failed", str(error), clock() - started))
+            log(f"   STOPPED: {error}")
+            stopped = True
+    return results
+
+
+def render_results(results: list[Result], markdown: bool = False) -> str:
+    rows = [(r.module, r.tag, r.outcome, f"{r.seconds / 60:.1f}" if r.seconds else "", r.detail) for r in results]
+    return "\n".join(_table(("Module", "Tag", "Outcome", "Minutes", "Detail"), rows, markdown))
+
+
+def _epoch(timestamp: str) -> float:
+    return datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+
+
+class GitHubOps:
+    """What the release does to the world: GitHub through the gh CLI, and Maven Central over HTTPS."""
+
+    def __init__(self, run=subprocess.run, exists=http_exists, clock=time.time, sleep=time.sleep):
+        self._run, self._exists, self._clock, self._sleep = run, exists, clock, sleep
+        self._dispatched_at = 0.0
+        self._run_id = None
+
+    def _gh(self, *args):
+        return self._run(["gh", *args], capture_output=True, text=True)
+
+    def _json(self, *args):
+        result = self._gh(*args)
+        if result.returncode != 0:
+            raise ReleaseFailed(f"gh {' '.join(args[:2])} failed: {result.stderr.strip()}")
+        return json.loads(result.stdout)
+
+    def tag_exists(self, module: str, tag: str) -> bool:
+        result = self._gh("api", f"repos/{ORG}/{module}/git/ref/tags/{tag}")
+        if result.returncode == 0:
+            return True
+        if "404" in result.stderr or "Not Found" in result.stderr:
+            return False
+        raise ReleaseFailed(f"cannot check whether the tag exists: {result.stderr.strip()}")
+
+    def dispatch(self, module: str, tag: str) -> None:
+        self._dispatched_at = self._clock()
+        result = self._gh("workflow", "run", "release.yml", "-R", f"{ORG}/{module}",
+                          "--ref", RELEASE_BRANCH, "-f", f"tag={tag}")
+        if result.returncode != 0:
+            raise ReleaseFailed(f"cannot start the release workflow: {result.stderr.strip()}")
+
+    def wait_for_run(self, module: str, timeout: float) -> Optional[Run]:
+        repo = f"{ORG}/{module}"
+
+        def started() -> bool:
+            runs = self._json("run", "list", "-R", repo, "--workflow", "release.yml", "--event",
+                              "workflow_dispatch", "--limit", "10", "--json", "databaseId,createdAt")
+            recent = [r for r in runs if _epoch(r["createdAt"]) >= self._dispatched_at - 60]
+            if recent:
+                self._run_id = max(recent, key=lambda r: _epoch(r["createdAt"]))["databaseId"]
+            return bool(recent)
+
+        if not wait_until(started, 300, self._clock, self._sleep, first=10):
+            raise ReleaseFailed("the release workflow did not start in 5 minutes")
+
+        final: dict = {}
+
+        def finished() -> bool:
+            final.update(self._json("run", "view", str(self._run_id), "-R", repo, "--json", "status,conclusion,url"))
+            return final["status"] == "completed"
+
+        if not wait_until(finished, timeout, self._clock, self._sleep, first=30):
+            return None
+        return Run(final["conclusion"], final["url"])
+
+    def on_central(self, module: str, version: str) -> bool:
+        base = f"{CENTRAL}/{GROUP_PATH}/{module}/{version}/{module}-{version}"
+        return self._exists(base + ".pom") and self._exists(base + ".jar")
+
+    def resolves(self, module: str, version: str) -> bool:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = Path(folder) / "settings.xml"
+            settings.write_text(_CENTRAL_ONLY, encoding="utf-8")
+            result = self._run(
+                ["mvn", "-B", "-q", "-s", str(settings), f"-Dmaven.repo.local={folder}/repository",
+                 "dependency:get", f"-Dartifact={GROUP}:{module}:{version}"],
+                capture_output=True, text=True)
+        return result.returncode == 0
+
+
+# ------------------------------------------------------------------------------------------- command line
+
 def default_workspace() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def command_plan(args: argparse.Namespace) -> int:
-    modules = modules_of((Path(args.workspace) / "pom.xml").read_text(encoding="utf-8"))
+def load_plan(workspace: str) -> Optional[Plan]:
+    modules = modules_of((Path(workspace) / "pom.xml").read_text(encoding="utf-8"))
     try:
-        plan = build_plan(modules, http_fetch)
+        return build_plan(modules, http_fetch)
     except (LookupError, ValueError, urllib.error.URLError) as error:
         print(f"Cannot build the plan: {error}", file=sys.stderr)
+        return None
+
+
+def append_summary(path: Optional[str], title: str, text: str) -> None:
+    if path:
+        with open(path, "a", encoding="utf-8") as summary:
+            summary.write(f"## {title}\n\n{text}\n\n")
+
+
+def command_plan(args: argparse.Namespace) -> int:
+    plan = load_plan(args.workspace)
+    if plan is None:
         return 2
     print(render(plan))
-    if args.summary:
-        with open(args.summary, "a", encoding="utf-8") as summary:
-            summary.write("## Release plan\n\n" + render(plan, markdown=True) + "\n")
+    append_summary(args.summary, "Release plan", render(plan, markdown=True))
     return 1 if plan.problems else 0
+
+
+def command_run(args: argparse.Namespace) -> int:
+    if not args.yes:
+        print("This publishes to Maven Central and it cannot be undone. Run it again with --yes to go on.",
+              file=sys.stderr)
+        return 2
+    if not os.environ.get("GH_TOKEN"):
+        print("GH_TOKEN is not set: the release needs a token that can run workflows in the module repositories.",
+              file=sys.stderr)
+        return 2
+    plan = load_plan(args.workspace)
+    if plan is None:
+        return 2
+    print(render(plan))
+    append_summary(args.summary, "Release plan", render(plan, markdown=True))
+    if plan.problems:
+        print("\nNothing is released until the problems above are solved.", file=sys.stderr)
+        return 1
+    if not plan.pending:
+        return 0
+    results = release(plan, GitHubOps(), args.run_timeout * 60, args.central_timeout * 60)
+    print("\n" + render_results(results))
+    append_summary(args.summary, "Release result", render_results(results, markdown=True))
+    return 0 if all(r.outcome == "released" for r in results) else 1
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Plans and runs the release of the Spool modules.")
     commands = parser.add_subparsers(dest="command", required=True)
+
+    def common(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--workspace", default=str(default_workspace()), help="folder with the workspace pom.xml")
+        command.add_argument("--summary", help="file to append a markdown version of the output to")
+
     plan = commands.add_parser("plan", help="show what would be released, in which order, and what is wrong")
-    plan.add_argument("--workspace", default=str(default_workspace()), help="folder with the workspace pom.xml")
-    plan.add_argument("--summary", help="file to append a markdown version of the plan to")
+    common(plan)
     plan.set_defaults(handler=command_plan)
+
+    run = commands.add_parser("run", help="release every pending module, one after the other")
+    common(run)
+    run.add_argument("--yes", action="store_true", help="confirm that it may publish to Maven Central")
+    run.add_argument("--run-timeout", type=int, default=45, help="minutes to wait for each release workflow")
+    run.add_argument("--central-timeout", type=int, default=60, help="minutes to wait for Central to show a version")
+    run.set_defaults(handler=command_run)
+
     args = parser.parse_args(argv)
     return args.handler(args)
 
