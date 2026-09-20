@@ -37,10 +37,8 @@ GROUP_PATH = "io/github/spool-framework"
 RELEASE_BRANCH = "main"
 DEVELOPMENT_BRANCH = "develop"
 
-# Modules that are not published to Maven Central, and why.
 NOT_ON_CENTRAL = {"watchdog": "it is published as a Docker image"}
 
-# Settings that send every repository to Central, so a version is resolved the way a consumer would.
 _CENTRAL_ONLY = (
     "<settings><mirrors><mirror><id>central-only</id><mirrorOf>*</mirrorOf>"
     f"<url>{CENTRAL}</url></mirror></mirrors></settings>"
@@ -51,7 +49,6 @@ _TRIPLET = re.compile(
 )
 _SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
 
-# Returns the text at a URL, or None when there is nothing there.
 Fetch = Callable[[str], Optional[str]]
 
 
@@ -106,16 +103,19 @@ def central_versions(module: str, fetch: Fetch) -> set[str]:
     return set(re.findall(r"<version>([^<]+)</version>", metadata)) if metadata else set()
 
 
-# --------------------------------------------------------------------------------------------- plan
-
 @dataclass
 class Entry:
+    """A module in the plan: the version on main, what Central already has and what it depends on.
+
+    version is the one in the pom on main, published the versions already on Central and dependencies the
+    (module, base version) pairs it asks for. skipped says why it is not released to Central, when it is not.
+    Problems stop the release, notes only inform."""
     module: str
-    version: str                                  # in the pom on main
-    published: set[str]                           # already on Central
-    dependencies: list[tuple[str, str]]           # (module, base version) it asks for
+    version: str
+    published: set[str]
+    dependencies: list[tuple[str, str]]
     develop_version: Optional[str] = None
-    skipped: Optional[str] = None                 # why it is not released to Central
+    skipped: Optional[str] = None
     problems: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -134,7 +134,8 @@ class Entry:
 
 @dataclass
 class Plan:
-    entries: list[Entry]                          # every module, each after the ones it depends on
+    """Every module, each one after the ones it depends on."""
+    entries: list[Entry]
 
     @property
     def pending(self) -> list[Entry]:
@@ -232,8 +233,6 @@ def render(plan: Plan, markdown: bool = False) -> str:
     return "\n".join(lines)
 
 
-# ------------------------------------------------------------------------------------------- release
-
 class ReleaseFailed(Exception):
     """The release of a module cannot go on. Nothing that depends on it is released after this."""
 
@@ -244,16 +243,18 @@ class ReleaseFailed(Exception):
 
 @dataclass
 class Run:
+    """How a release workflow ended, and the error lines of its log when it did not succeed."""
     conclusion: str
     url: str
-    excerpt: str = ""           # the error lines of the log, when the run did not succeed
+    excerpt: str = ""
 
 
 @dataclass
 class Result:
+    """What happened to a module: released, failed or not attempted."""
     module: str
     tag: str
-    outcome: str                # released, failed or not attempted
+    outcome: str
     detail: str = ""
     seconds: float = 0.0
     excerpt: str = ""
@@ -298,8 +299,6 @@ def wait_until(condition: Callable[[], bool], timeout: float, clock: Callable[[]
         pause = min(pause * factor, cap)
 
 
-# What one module takes when nothing has been measured yet: its workflow, about two minutes, and Central
-# showing the version, which took between 7 and 14 minutes in the first releases.
 USUAL_MODULE_SECONDS = 16 * 60
 
 
@@ -317,7 +316,8 @@ def seconds_left(current_elapsed: float, after_it: int, took: list[float]) -> fl
     """An estimate: the module in progress needs the usual time, and so does each one after it.
 
     The usual time is the average of the modules already released in this run, or USUAL_MODULE_SECONDS
-    at the start."""
+    at the start: a workflow of about two minutes plus the 7 to 14 that Central took to show the version
+    in the first releases."""
     usual = sum(took) / len(took) if took else USUAL_MODULE_SECONDS
     return max(usual - current_elapsed, 0) + after_it * usual
 
@@ -348,7 +348,11 @@ def unpublished_dependencies(plan: Plan, ops) -> dict[str, str]:
 def release(plan: Plan, ops, run_timeout: float = 45 * 60, central_timeout: float = 60 * 60,
             log: Callable[[str], None] = print, clock: Callable[[], float] = time.monotonic,
             sleep: Callable[[float], None] = time.sleep) -> list[Result]:
-    """Releases the pending modules in order and stops at the first one that fails."""
+    """Releases the pending modules in order and stops at the first one that fails.
+
+    Nothing is released when a dependency did not get its SNAPSHOT published. A tag that exists while its
+    version is not on Central is a release that failed before reaching it: the version is not lost, so it is
+    released again as long as the tag holds the version the plan expects."""
     blocked = unpublished_dependencies(plan, ops)
     if blocked:
         for module, why in blocked.items():
@@ -360,7 +364,7 @@ def release(plan: Plan, ops, run_timeout: float = 45 * 60, central_timeout: floa
     results, stopped = [], False
     pending = plan.pending
     states = {entry.module: (" ", "") for entry in pending}
-    took: list[float] = []                     # seconds each released module took, for the estimate
+    took: list[float] = []
 
     def show(title: str) -> None:
         log(f"== {title}")
@@ -389,8 +393,6 @@ def release(plan: Plan, ops, run_timeout: float = 45 * 60, central_timeout: floa
             states[entry.module] = (">", "starting")
             show(f"{where} {entry.module} {entry.tag}")
             if ops.tag_exists(entry.module, entry.tag):
-                # A release that failed after creating the tag, before reaching Central. The version is
-                # not burned, so it can be released again as long as the tag holds what the plan expects.
                 held = ops.tag_version(entry.module, entry.tag)
                 if held != entry.base:
                     raise ReleaseFailed(f"the tag {entry.tag} exists but holds version {held}, not {entry.base}")
@@ -466,8 +468,10 @@ class GitHubOps:
         return json.loads(result.stdout)
 
     def tag_exists(self, module: str, tag: str) -> bool:
-        # matching-refs answers with a list, empty when there is nothing, so a failed call is always a
-        # real error and the exit code is enough. It matches by prefix, hence the exact comparison.
+        """Whether the tag exists.
+
+        matching-refs answers with a list, empty when there is nothing, so a failed call is always a real
+        error and the exit code is enough. It matches by prefix, hence the exact comparison."""
         refs = self._json("api", f"repos/{ORG}/{module}/git/matching-refs/tags/{tag}")
         return any(ref["ref"] == f"refs/tags/{tag}" for ref in refs)
 
@@ -545,12 +549,13 @@ class GitHubOps:
         return None
 
     def resolution_error(self, module: str, version: str) -> Optional[str]:
-        """Why Maven cannot resolve the module from Central alone, or None when it can."""
+        """Why Maven cannot resolve the module from Central alone, or None when it can.
+
+        It runs in an empty folder: in one with a pom.xml Maven would load that project first, and the
+        workspace pom lists modules that are not cloned on a runner."""
         with tempfile.TemporaryDirectory() as folder:
             settings = Path(folder) / "settings.xml"
             settings.write_text(_CENTRAL_ONLY, encoding="utf-8")
-            # Run in an empty folder: in one with a pom.xml Maven would load that project first, and the
-            # workspace pom lists modules that are not cloned on a runner.
             result = self._run(
                 ["mvn", "-B", "-q", "-s", str(settings), f"-Dmaven.repo.local={folder}/repository",
                  "dependency:get", f"-Dartifact={GROUP}:{module}:{version}"],
@@ -559,8 +564,6 @@ class GitHubOps:
             return None
         return error_lines(result.stdout + result.stderr) or f"mvn ended with code {result.returncode}"
 
-
-# ------------------------------------------------------------------------------------------- command line
 
 def default_workspace() -> Path:
     return Path(__file__).resolve().parent.parent

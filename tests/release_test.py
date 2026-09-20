@@ -129,7 +129,7 @@ class BuildPlanTest(unittest.TestCase):
 
     def test_a_dependency_on_a_version_that_will_never_exist_is_a_problem(self):
         main = after_the_bump()
-        main["janitor"] = pom("janitor", "1.2.0-SNAPSHOT", ("core", "1.2.0-SNAPSHOT"))   # forgot to bump it
+        main["janitor"] = pom("janitor", "1.2.0-SNAPSHOT", ("core", "1.2.0-SNAPSHOT"))
 
         plan = release.build_plan(MODULES, world(main))
 
@@ -186,14 +186,18 @@ class RenderTest(unittest.TestCase):
 
 
 class FakeOps:
-    """Stands in for GitHub and Central. Each module can be told to fail at one step."""
+    """Stands in for GitHub and Central. Each module can be told to fail at one step.
+
+    unpublished maps a module to why its SNAPSHOT is not in GitHub Packages, tags a tag to the version of the
+    pom it points at, running the modules with a release workflow in progress, and central_after says how many
+    times Central answers no before it answers yes."""
 
     def __init__(self, fail_at=None, tags=None, central_after=0, running=(), unpublished=None):
-        self.unpublished = unpublished or {}   # module -> why its SNAPSHOT is not in GitHub Packages
+        self.unpublished = unpublished or {}
         self.fail_at = fail_at or {}
-        self.tags = tags or {}                 # tag -> version of the pom it points at
-        self.busy = set(running)               # modules with a release workflow in progress
-        self.central_after = central_after     # how many times Central says no before it says yes
+        self.tags = tags or {}
+        self.busy = set(running)
+        self.central_after = central_after
         self.calls = []
         self._asked = {}
 
@@ -470,8 +474,6 @@ class ReleaseTest(unittest.TestCase):
 
         release.unpublished_dependencies(plan, Ops())
 
-        # janitor, infrastructure, dsl and runtime are pending; they depend on core, janitor, crawler,
-        # ingester, mounter, infrastructure and dsl. The ones nobody pending needs are left out.
         self.assertEqual(asked, ["core", "crawler", "janitor", "mounter", "ingester", "infrastructure", "dsl"])
 
     def test_a_release_already_running_is_not_started_a_second_time(self):
@@ -647,7 +649,7 @@ class GitHubOpsTest(unittest.TestCase):
                 if command[:3] == ["gh", "run", "view"] and "--json" in command:
                     return Completed(json.dumps(next(states)))
                 if command[:3] == ["gh", "run", "view"]:
-                    return Completed(returncode=1)         # the log of the failed run
+                    return Completed(returncode=1)
                 return super().__call__(command, **kwargs)
 
         ops, _ = github_ops(Gh((["gh", "workflow"], Completed()), (["gh", "run", "list"], Completed(listing))),
@@ -715,8 +717,7 @@ class OutputsTest(unittest.TestCase):
         release.write_outputs(None, release.build_plan(MODULES, world(after_the_bump())))
 
 
-# Lines as gh prints them for a failed step: job, step and time in front of each one.
-FAILED_LOG = "\n".join([
+GH_LOG_OF_A_FAILED_STEP = "\n".join([
     "release / publish\tUNKNOWN STEP\t2026-09-20T17:19:59.8111103Z [WARNING] public Janitor(JanitorStrategy strategy) {",
     "release / publish\tUNKNOWN STEP\t2026-09-20T17:20:11.3471477Z [ERROR] Unable to upload bundle for deployment: Deployment",
     "release / publish\tUNKNOWN STEP\t2026-09-20T17:20:11.3473968Z java.lang.RuntimeException: Invalid request. Status: 401",
@@ -730,7 +731,7 @@ FAILED_LOG = "\n".join([
 
 class ErrorLinesTest(unittest.TestCase):
     def test_keeps_only_the_error_lines_without_what_gh_puts_in_front(self):
-        self.assertEqual(release.error_lines(FAILED_LOG).splitlines(), [
+        self.assertEqual(release.error_lines(GH_LOG_OF_A_FAILED_STEP).splitlines(), [
             "[ERROR] Unable to upload bundle for deployment: Deployment",
             "java.lang.RuntimeException: Invalid request. Status: 401",
             "[ERROR] Failed to execute goal central-publishing-maven-plugin:0.7.0:publish",
@@ -761,7 +762,7 @@ class FailureExcerptTest(unittest.TestCase):
         return ops.wait_for_run("janitor", 3600)
 
     def test_a_failed_run_comes_with_its_error_lines(self):
-        run = self.failed_run(Completed(FAILED_LOG))
+        run = self.failed_run(Completed(GH_LOG_OF_A_FAILED_STEP))
 
         self.assertEqual(run.conclusion, "failure")
         self.assertIn("[ERROR] Unable to upload bundle for deployment: Deployment", run.excerpt)
