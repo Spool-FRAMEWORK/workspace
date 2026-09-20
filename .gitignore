@@ -20,3 +20,4 @@ settings-local.xml
 
 # The wrapper jar is downloaded on demand and must not be committed
 .mvn/wrapper/maven-wrapper.jar
+__pycache__/
