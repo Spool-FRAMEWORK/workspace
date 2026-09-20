@@ -57,9 +57,10 @@ triplets() {
 
 # Rewrites the version of every listed artifact, both where it is the module itself and where it is
 # a dependency. $2 is a space separated list of artifactId=version.
+# awk handles CRLF differently on each platform, so the CRs are stripped, the file edited and the CRs put
+# back if the file had them. awk also ends the last line with a newline, so a file that had none is kept
+# that way. A file that ends up identical is left untouched.
 apply_versions() {
-    # awk handles CRLF differently on each platform, so strip the CRs, edit, and put them back
-    # if the file had them. A file that ends up identical is left untouched.
     eol='\n'
     eol_bytes=1
     if [ "$(tr -cd '\r' < "$1" | wc -c)" -gt 0 ]; then eol='\r\n'; eol_bytes=2; fi
@@ -74,7 +75,6 @@ apply_versions() {
         NF { state = 0 }
         { print }
     ' > "$1.tmp"
-    # awk always ends the last line with a newline; keep the file as it was if it had none
     if [ "$(tail -c 1 "$1" | od -An -tx1 | tr -d ' \n')" != "0a" ]; then
         head -c $(( $(wc -c < "$1.tmp") - eol_bytes )) "$1.tmp" > "$1.tmp2" && mv "$1.tmp2" "$1.tmp"
     fi

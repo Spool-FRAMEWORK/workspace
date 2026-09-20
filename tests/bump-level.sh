@@ -18,7 +18,7 @@ check() {
 }
 
 check 1.2.0-SNAPSHOT 1.2.1-SNAPSHOT patch
-check 1.2.1-SNAPSHOT 1.3.0-SNAPSHOT minor   # the parts to the right go down to 0
+check 1.2.1-SNAPSHOT 1.3.0-SNAPSHOT minor
 check 1.2.9 2.0.0 major
 check 1.9.9 1.10.0 minor
 check 1.2.1-SNAPSHOT 1.2.0-SNAPSHOT down

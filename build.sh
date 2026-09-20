@@ -6,6 +6,10 @@
 #   ./build.sh core --tests        same, running the tests too
 #   ./build.sh dsl --fast          skip rebuilding upstream modules (they must already be in ~/.m2)
 #   ./build.sh dsl --no-install    package only, leave ~/.m2 untouched
+#
+# The scope of a module is worked out in two passes: its dependents can need other modules too
+# (infrastructure needs janitor, mounter and ingester), so first the module and its dependents are listed,
+# then they are built together with everything upstream of them.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -34,9 +38,6 @@ if [ -n "$module" ]; then
     if [ "$fast" -eq 1 ]; then
         set -- "$@" -pl ":$module" -amd
     else
-        # The dependents of a module can need other modules too (infrastructure needs janitor,
-        # mounter and ingester), so first list the module plus its dependents, then build that
-        # set together with everything upstream of it.
         listing=$(sh "$here/mvnw" -B -f "$here/pom.xml" -pl ":$module" -amd validate 2>&1) || {
             printf '%s\n' "$listing" >&2
             exit 1
