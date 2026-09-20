@@ -42,6 +42,11 @@ jobs:
         working-directory: workspace
         run: sh ./bootstrap.sh
 
+      - name: Check that the module versions are consistent
+        shell: bash
+        working-directory: workspace
+        run: sh ./bump.sh --check
+
       - name: Build every module
         shell: bash
         working-directory: workspace
