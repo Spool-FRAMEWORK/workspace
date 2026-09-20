@@ -61,7 +61,7 @@ cd workspace
 | Command | What it builds |
 |---|---|
 | `./build.sh` | Every module, in dependency order |
-| `./build.sh infrastructure` | `infrastructure` plus everything it depends on and everything that depends on it |
+| `./build.sh infrastructure` | `infrastructure`, everything that depends on it, and whatever those need to build |
 | `./build.sh core --tests` | Same idea for `core`, running the tests |
 | `./build.sh dsl --fast` | Only `dsl` and its dependents. Upstream modules must already be in `~/.m2` |
 | `./build.sh dsl --no-install` | Package only, leaving `~/.m2` untouched |
