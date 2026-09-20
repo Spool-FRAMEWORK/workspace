@@ -451,5 +451,20 @@ def datetime_of(epoch):
     return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+class OutputsTest(unittest.TestCase):
+    def test_a_workflow_is_told_how_many_modules_are_pending_and_how_many_problems_there_are(self):
+        import tempfile
+        plan = release.build_plan(MODULES, world(after_the_bump()))
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "output"
+
+            release.write_outputs(str(path), plan)
+
+            self.assertEqual(path.read_text(), "pending=4\nproblems=0\n")
+
+    def test_nothing_is_written_when_no_file_is_given(self):
+        release.write_outputs(None, release.build_plan(MODULES, world(after_the_bump())))
+
+
 if __name__ == "__main__":
     unittest.main()

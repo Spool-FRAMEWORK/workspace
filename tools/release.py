@@ -404,12 +404,20 @@ def append_summary(path: Optional[str], title: str, text: str) -> None:
             summary.write(f"## {title}\n\n{text}\n\n")
 
 
+def write_outputs(path: Optional[str], plan: Plan) -> None:
+    """Lets a workflow decide what to do next: how many modules are pending and how many problems there are."""
+    if path:
+        with open(path, "a", encoding="utf-8") as outputs:
+            outputs.write(f"pending={len(plan.pending)}\nproblems={len(plan.problems)}\n")
+
+
 def command_plan(args: argparse.Namespace) -> int:
     plan = load_plan(args.workspace)
     if plan is None:
         return 2
     print(render(plan))
     append_summary(args.summary, "Release plan", render(plan, markdown=True))
+    write_outputs(args.github_output, plan)
     return 1 if plan.problems else 0
 
 
@@ -448,6 +456,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     plan = commands.add_parser("plan", help="show what would be released, in which order, and what is wrong")
     common(plan)
+    plan.add_argument("--github-output", help="file to write pending=N and problems=N to, for a workflow")
     plan.set_defaults(handler=command_plan)
 
     run = commands.add_parser("run", help="release every pending module, one after the other")
