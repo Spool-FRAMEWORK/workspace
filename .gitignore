@@ -1,0 +1,22 @@
+# Build output
+target/
+
+# IDEs and editors
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local overrides and logs
+*.log
+.env
+settings-local.xml
+
+# The wrapper jar is downloaded on demand and must not be committed
+.mvn/wrapper/maven-wrapper.jar

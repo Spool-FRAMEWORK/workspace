@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!--
+        Development-only aggregator. It is NOT a parent of any module and is never published:
+        it only lets Maven see all the Spool repositories as a single reactor, so it can work out
+        the build order and rebuild "a module plus everything that depends on it" in one command.
+        Each module keeps its own repository, version and release pipeline.
+    -->
+    <groupId>io.github.spool-framework</groupId>
+    <artifactId>spool-workspace</artifactId>
+    <version>0.0.0</version>
+    <packaging>pom</packaging>
+    <name>Spool workspace (dev only)</name>
+
+    <modules>
+        <module>../core</module>
+        <module>../validator</module>
+        <module>../crawler</module>
+        <module>../janitor</module>
+        <module>../mounter</module>
+        <module>../ingester</module>
+        <module>../infrastructure</module>
+        <module>../dsl</module>
+        <module>../runtime</module>
+        <module>../watchdog</module>
+    </modules>
+</project>
