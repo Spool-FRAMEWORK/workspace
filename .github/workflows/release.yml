@@ -1,0 +1,58 @@
+name: Release
+
+# Releases to Maven Central every module whose version on main is not there yet, in dependency order.
+# It runs on GitHub, not on anybody's machine. It starts each module's own release workflow, waits for
+# it, waits for Central to show the version, checks it can be resolved, and only then goes to the next one.
+# The first failure stops it, so nothing is ever released against a version that does not exist.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only show the plan, release nothing'
+        type: boolean
+        default: true
+
+# Two releases at the same time would fight over the same tags and versions.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      pending: ${{ steps.plan.outputs.pending }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out what would be released
+        id: plan
+        run: python3 tools/release.py plan --summary "$GITHUB_STEP_SUMMARY" --github-output "$GITHUB_OUTPUT"
+
+  release:
+    name: Release
+    needs: plan
+    if: ${{ !inputs.dry_run && needs.plan.outputs.pending != '0' }}
+    runs-on: ubuntu-latest
+    # Publishing cannot be undone: the reviewers of this environment approve it before it starts.
+    environment: release
+    timeout-minutes: 300
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+
+      - name: Release the pending modules
+        env:
+          # A token that can start workflows in the module repositories; GITHUB_TOKEN cannot reach them.
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: python3 tools/release.py run --yes --summary "$GITHUB_STEP_SUMMARY"
