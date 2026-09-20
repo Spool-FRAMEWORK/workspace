@@ -1,0 +1,86 @@
+name: CI
+
+# Checks that a fresh developer can go from nothing to a full build on every OS:
+# clone the workspace, clone the modules with bootstrap, and build them in dependency order.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    permissions:
+      contents: read
+      packages: read
+    env:
+      GITHUB_ACTOR: ${{ github.actor }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      # The modules are cloned as siblings of this folder, which is the layout the scripts expect.
+      - uses: actions/checkout@v4
+        with:
+          path: workspace
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          server-id: github
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
+
+      - name: Clone the modules
+        shell: bash
+        working-directory: workspace
+        run: sh ./bootstrap.sh
+
+      - name: Build every module
+        shell: bash
+        working-directory: workspace
+        run: sh ./build.sh
+
+      - name: Build one module through the PowerShell script
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: workspace
+        run: |
+          .\bootstrap.ps1
+          .\build.ps1 crawler -NoInstall
+
+  tests:
+    name: Tests on ubuntu-latest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    env:
+      GITHUB_ACTOR: ${{ github.actor }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: workspace
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          server-id: github
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
+
+      - name: Clone the modules
+        working-directory: workspace
+        run: sh ./bootstrap.sh
+
+      - name: Build and run the tests of every module
+        working-directory: workspace
+        run: sh ./build.sh --tests
