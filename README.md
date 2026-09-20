@@ -90,6 +90,25 @@ core ─> watchdog     (nothing depends on it)
 
 `./build.sh <module>` already does this for you.
 
+## Versions
+
+Each module has its own version and depends on specific versions of the others, so when one module changes the modules
+that depend on it change too. `bump.sh` does that for you:
+
+```bash
+./bump.sh janitor 1.3.0-SNAPSHOT     # set janitor's version, its dependents follow
+./bump.sh janitor 1.3.0 --dry-run    # show the plan without touching any file
+./bump.sh --check                    # verify every dependency matches the module's real version
+```
+
+The part that grows in the module you change (major, minor or patch) is the part that grows in each module that depends
+on it. If `janitor` goes from 1.2.1 to 1.3.0 (a minor), `infrastructure` 1.3.0 becomes 1.4.0 and `runtime` 1.4.0 becomes
+1.5.0, and their dependencies on `janitor` are rewritten to the new version. Pass `--patch`, `--minor` or `--major` to
+force the part that grows in the dependents. Nothing is committed: review and commit each repository yourself.
+
+`bump.sh` needs a POSIX shell, so on Windows use Git Bash or WSL. CI runs `./bump.sh --check` to catch versions that
+drift apart.
+
 ## Working in an IDE
 
 Open `pom.xml` from this repository as a Maven project. The ten modules are imported together, so you can navigate and
