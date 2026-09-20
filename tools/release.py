@@ -293,10 +293,33 @@ def wait_until(condition: Callable[[], bool], timeout: float, clock: Callable[[]
         pause = min(pause * factor, cap)
 
 
+def unpublished_dependencies(plan: Plan, ops) -> dict[str, str]:
+    """Modules that a pending one depends on whose SNAPSHOT did not get to GitHub Packages, and why.
+
+    The release workflow of a module builds it against the SNAPSHOT of its dependencies, which
+    publish-develop puts there. If that failed, the release would fail after creating its tag."""
+    needed = {dependency for entry in plan.pending for dependency, _ in entry.dependencies}
+    problems = {}
+    for entry in plan.entries:
+        if entry.module in needed:
+            problem = ops.snapshot_problem(entry.module)
+            if problem is not None:
+                problems[entry.module] = problem
+    return problems
+
+
 def release(plan: Plan, ops, run_timeout: float = 45 * 60, central_timeout: float = 60 * 60,
             log: Callable[[str], None] = print, clock: Callable[[], float] = time.monotonic,
             sleep: Callable[[float], None] = time.sleep) -> list[Result]:
     """Releases the pending modules in order and stops at the first one that fails."""
+    blocked = unpublished_dependencies(plan, ops)
+    if blocked:
+        for module, why in blocked.items():
+            log(f"   {module} is not published to GitHub Packages: {why}")
+        log("   Nothing was released: the release of a module builds against the SNAPSHOT of its dependencies.")
+        return [Result(entry.module, entry.tag, "not attempted", "; ".join(
+                    f"{dependency}: {blocked[dependency]}" for dependency, _ in entry.dependencies
+                    if dependency in blocked)) for entry in plan.pending]
     results, stopped = [], False
     for entry in plan.pending:
         if stopped:
@@ -439,6 +462,19 @@ class GitHubOps:
     def on_central(self, module: str, version: str) -> bool:
         base = f"{CENTRAL}/{GROUP_PATH}/{module}/{version}/{module}-{version}"
         return self._exists(base + ".pom") and self._exists(base + ".jar")
+
+    def snapshot_problem(self, module: str) -> Optional[str]:
+        """Why the last publish of the module from develop did not leave its SNAPSHOT in GitHub Packages."""
+        runs = self._json("run", "list", "-R", f"{ORG}/{module}", "--workflow", "publish-develop.yml",
+                          "--branch", DEVELOPMENT_BRANCH, "--limit", "1", "--json", "status,conclusion,url")
+        if not runs:
+            return f"it was never published from {DEVELOPMENT_BRANCH}"
+        run = runs[0]
+        if run["status"] != "completed":
+            return f"its latest publish is still {run['status']}: {run['url']}"
+        if run["conclusion"] != "success":
+            return f"its latest publish ended as {run['conclusion']}: {run['url']}"
+        return None
 
     def resolution_error(self, module: str, version: str) -> Optional[str]:
         """Why Maven cannot resolve the module from Central alone, or None when it can."""

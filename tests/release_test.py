@@ -187,13 +187,17 @@ class RenderTest(unittest.TestCase):
 class FakeOps:
     """Stands in for GitHub and Central. Each module can be told to fail at one step."""
 
-    def __init__(self, fail_at=None, tags=None, central_after=0, running=()):
+    def __init__(self, fail_at=None, tags=None, central_after=0, running=(), unpublished=None):
+        self.unpublished = unpublished or {}   # module -> why its SNAPSHOT is not in GitHub Packages
         self.fail_at = fail_at or {}
         self.tags = tags or {}                 # tag -> version of the pom it points at
         self.busy = set(running)               # modules with a release workflow in progress
         self.central_after = central_after     # how many times Central says no before it says yes
         self.calls = []
         self._asked = {}
+
+    def snapshot_problem(self, module):
+        return self.unpublished.get(module)
 
     def tag_exists(self, module, tag):
         return tag in self.tags
@@ -346,6 +350,36 @@ class ReleaseTest(unittest.TestCase):
         self.assertIn(("dispatch", "janitor", "v1.2.1"), ops.calls)
         self.assertTrue(any("exists but 1.2.1 is not on Central" in line for line in lines))
 
+    def test_nothing_is_released_when_a_dependency_never_got_its_snapshot_published(self):
+        ops = FakeOps(unpublished={"janitor": "its latest publish ended as failure: https://runs/1"})
+        lines = []
+        plan = release.build_plan(MODULES, world(after_the_bump()))
+        clock = FakeClock()
+
+        results = release.release(plan, ops, log=lines.append, clock=clock, sleep=clock.sleep)
+
+        self.assertEqual([r.outcome for r in results], ["not attempted"] * 4)
+        self.assertEqual([c for c in ops.calls if c[0] == "dispatch"], [])
+        self.assertIn("infrastructure", [r.module for r in results])
+        infrastructure = next(r for r in results if r.module == "infrastructure")
+        self.assertEqual(infrastructure.detail, "janitor: its latest publish ended as failure: https://runs/1")
+        self.assertTrue(any("Nothing was released" in line for line in lines))
+
+    def test_only_the_dependencies_of_pending_modules_are_checked(self):
+        asked = []
+
+        class Ops(FakeOps):
+            def snapshot_problem(self, module):
+                asked.append(module)
+
+        plan = release.build_plan(MODULES, world(after_the_bump()))
+
+        release.unpublished_dependencies(plan, Ops())
+
+        # janitor, infrastructure, dsl and runtime are pending; they depend on core, janitor, crawler,
+        # ingester, mounter, infrastructure and dsl. The ones nobody pending needs are left out.
+        self.assertEqual(asked, ["core", "crawler", "janitor", "mounter", "ingester", "infrastructure", "dsl"])
+
     def test_a_release_already_running_is_not_started_a_second_time(self):
         ops = FakeOps(tags={"v1.2.1": "1.2.1"}, running={"janitor"})
 
@@ -437,6 +471,33 @@ class GitHubOpsTest(unittest.TestCase):
 
         with self.assertRaises(release.ReleaseFailed):
             ops.tag_version("janitor", "v1.2.1")
+
+    def snapshot_problem_of(self, run):
+        gh = FakeGh((["gh", "run", "list"], Completed(json.dumps([run] if run else []))))
+        ops, _ = github_ops(gh)
+        return ops.snapshot_problem("infrastructure"), gh.commands[0]
+
+    def test_a_snapshot_is_fine_when_the_last_publish_from_develop_succeeded(self):
+        problem, command = self.snapshot_problem_of({"status": "completed", "conclusion": "success", "url": "u"})
+
+        self.assertIsNone(problem)
+        self.assertEqual(command[:9], ["gh", "run", "list", "-R", "Spool-FRAMEWORK/infrastructure", "--workflow",
+                                       "publish-develop.yml", "--branch", "develop"])
+
+    def test_a_snapshot_whose_last_publish_failed_is_a_problem_with_the_run_to_look_at(self):
+        problem, _ = self.snapshot_problem_of({"status": "completed", "conclusion": "failure", "url": "https://runs/7"})
+
+        self.assertEqual(problem, "its latest publish ended as failure: https://runs/7")
+
+    def test_a_publish_still_running_is_a_problem_too(self):
+        problem, _ = self.snapshot_problem_of({"status": "in_progress", "conclusion": "", "url": "https://runs/8"})
+
+        self.assertEqual(problem, "its latest publish is still in_progress: https://runs/8")
+
+    def test_a_module_never_published_from_develop_is_a_problem(self):
+        problem, _ = self.snapshot_problem_of(None)
+
+        self.assertEqual(problem, "it was never published from develop")
 
     def test_a_workflow_is_running_when_one_is_queued_or_in_progress(self):
         queued = FakeGh((["gh", "run", "list", "-R", "Spool-FRAMEWORK/janitor", "--workflow", "release.yml",
