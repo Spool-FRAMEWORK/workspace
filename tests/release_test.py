@@ -221,9 +221,9 @@ class FakeOps:
         self.calls.append(("central", module))
         return self._asked[module] > self.central_after
 
-    def resolves(self, module, version):
+    def resolution_error(self, module, version):
         self.calls.append(("resolves", module))
-        return self.fail_at.get(module) != "resolve"
+        return "[ERROR] Could not find artifact" if self.fail_at.get(module) == "resolve" else None
 
 
 class FakeClock:
@@ -322,6 +322,7 @@ class ReleaseTest(unittest.TestCase):
 
         self.assertEqual([r.outcome for r in results], ["released", "released", "failed", "not attempted"])
         self.assertIn("cannot be resolved", results[2].detail)
+        self.assertEqual(results[2].excerpt, "[ERROR] Could not find artifact")
 
     def test_a_tag_that_holds_another_version_is_never_released_over(self):
         ops = FakeOps(tags={"v1.2.1": "1.2.0"})
@@ -377,10 +378,11 @@ class FakeGh:
     """Answers the gh and mvn commands GitHubOps runs, from a list of (prefix, reply)."""
 
     def __init__(self, *replies):
-        self.replies, self.commands = list(replies), []
+        self.replies, self.commands, self.options = list(replies), [], []
 
-    def __call__(self, command, **_):
+    def __call__(self, command, **options):
         self.commands.append(command)
+        self.options.append(options)
         for prefix, reply in self.replies:
             if command[: len(prefix)] == prefix:
                 return reply
@@ -510,10 +512,32 @@ class GitHubOpsTest(unittest.TestCase):
         gh = FakeGh((["mvn"], Completed()))
         ops, _ = github_ops(gh)
 
-        self.assertTrue(ops.resolves("janitor", "1.2.1"))
+        self.assertIsNone(ops.resolution_error("janitor", "1.2.1"))
         command = gh.commands[0]
         self.assertIn("-Dartifact=io.github.spool-framework:janitor:1.2.1", command)
         self.assertIn("-s", command)
+
+    def test_maven_runs_in_an_empty_folder_and_not_in_the_project_that_is_open(self):
+        gh = FakeGh((["mvn"], Completed()))
+        ops, _ = github_ops(gh)
+
+        ops.resolution_error("janitor", "1.2.1")
+
+        folder = gh.options[0]["cwd"]
+        self.assertIn(f"-Dmaven.repo.local={folder}/repository", gh.commands[0])
+        self.assertNotEqual(Path(folder).resolve(), Path.cwd().resolve())
+
+    def test_a_module_that_cannot_be_resolved_comes_with_the_error_maven_gave(self):
+        output = "[INFO] Downloading\n[ERROR] Could not find artifact io.github.spool-framework:core:jar:9.9.9\n"
+        ops, _ = github_ops(FakeGh((["mvn"], Completed(stdout=output, returncode=1))))
+
+        self.assertEqual(ops.resolution_error("janitor", "1.2.1"),
+                         "[ERROR] Could not find artifact io.github.spool-framework:core:jar:9.9.9")
+
+    def test_a_maven_failure_without_error_lines_still_says_it_failed(self):
+        ops, _ = github_ops(FakeGh((["mvn"], Completed(returncode=1))))
+
+        self.assertEqual(ops.resolution_error("janitor", "1.2.1"), "mvn ended with code 1")
 
 
 def datetime_of(epoch):

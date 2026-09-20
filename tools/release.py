@@ -324,8 +324,9 @@ def release(plan: Plan, ops, run_timeout: float = 45 * 60, central_timeout: floa
             log("   workflow finished, waiting for Central to show the version")
             if not wait_until(lambda: ops.on_central(entry.module, entry.base), central_timeout, clock, sleep):
                 raise ReleaseFailed(f"Central does not show {entry.base} after {int(central_timeout // 60)} minutes")
-            if not ops.resolves(entry.module, entry.base):
-                raise ReleaseFailed("it is on Central but cannot be resolved the way a consumer would")
+            problem = ops.resolution_error(entry.module, entry.base)
+            if problem is not None:
+                raise ReleaseFailed("it is on Central but cannot be resolved the way a consumer would", problem)
             results.append(Result(entry.module, entry.tag, "released", run.url, clock() - started))
             log(f"   released in {(clock() - started) / 60:.1f} minutes")
         except ReleaseFailed as error:
@@ -439,15 +440,20 @@ class GitHubOps:
         base = f"{CENTRAL}/{GROUP_PATH}/{module}/{version}/{module}-{version}"
         return self._exists(base + ".pom") and self._exists(base + ".jar")
 
-    def resolves(self, module: str, version: str) -> bool:
+    def resolution_error(self, module: str, version: str) -> Optional[str]:
+        """Why Maven cannot resolve the module from Central alone, or None when it can."""
         with tempfile.TemporaryDirectory() as folder:
             settings = Path(folder) / "settings.xml"
             settings.write_text(_CENTRAL_ONLY, encoding="utf-8")
+            # Run in an empty folder: in one with a pom.xml Maven would load that project first, and the
+            # workspace pom lists modules that are not cloned on a runner.
             result = self._run(
                 ["mvn", "-B", "-q", "-s", str(settings), f"-Dmaven.repo.local={folder}/repository",
                  "dependency:get", f"-Dartifact={GROUP}:{module}:{version}"],
-                capture_output=True, text=True)
-        return result.returncode == 0
+                capture_output=True, text=True, cwd=folder)
+        if result.returncode == 0:
+            return None
+        return error_lines(result.stdout + result.stderr) or f"mvn ended with code {result.returncode}"
 
 
 # ------------------------------------------------------------------------------------------- command line
