@@ -280,17 +280,54 @@ def error_lines(log: str, limit: int = 15) -> str:
 
 def wait_until(condition: Callable[[], bool], timeout: float, clock: Callable[[], float] = time.monotonic,
                sleep: Callable[[float], None] = time.sleep, first: float = 20.0, factor: float = 1.5,
-               cap: float = 120.0) -> bool:
-    """Asks again and again, waiting a little longer each time, until it is true or the time is up."""
-    deadline, pause = clock() + timeout, first
+               cap: float = 120.0, on_wait: Optional[Callable[[float], None]] = None) -> bool:
+    """Asks again and again, waiting a little longer each time, until it is true or the time is up.
+
+    on_wait is told how long it has been waiting each time the answer is still no."""
+    started = clock()
+    deadline, pause = started + timeout, first
     while True:
         if condition():
             return True
         remaining = deadline - clock()
         if remaining <= 0:
             return False
+        if on_wait:
+            on_wait(clock() - started)
         sleep(min(pause, remaining))
         pause = min(pause * factor, cap)
+
+
+# What one module takes when nothing has been measured yet: its workflow, about two minutes, and Central
+# showing the version, which took between 7 and 14 minutes in the first releases.
+USUAL_MODULE_SECONDS = 16 * 60
+
+
+def format_duration(seconds: float) -> str:
+    minutes, rest = divmod(int(seconds), 60)
+    return f"{minutes}m {rest:02d}s" if minutes else f"{rest}s"
+
+
+def format_minutes(seconds: float) -> str:
+    """For estimates, where the seconds only add noise."""
+    return f"{max(round(seconds / 60), 0)} min"
+
+
+def seconds_left(current_elapsed: float, after_it: int, took: list[float]) -> float:
+    """An estimate: the module in progress needs the usual time, and so does each one after it.
+
+    The usual time is the average of the modules already released in this run, or USUAL_MODULE_SECONDS
+    at the start."""
+    usual = sum(took) / len(took) if took else USUAL_MODULE_SECONDS
+    return max(usual - current_elapsed, 0) + after_it * usual
+
+
+def render_progress(entries: list[Entry], states: dict[str, tuple[str, str]]) -> str:
+    """A checklist of the modules to release: [x] done, [>] in progress, [!] failed and [ ] still to do."""
+    width = max(len(f"{entry.module} {entry.tag}") for entry in entries)
+    return "\n".join(
+        f"   [{states[entry.module][0]}] {f'{entry.module} {entry.tag}'.ljust(width)}  {states[entry.module][1]}".rstrip()
+        for entry in entries)
 
 
 def unpublished_dependencies(plan: Plan, ops) -> dict[str, str]:
@@ -321,13 +358,36 @@ def release(plan: Plan, ops, run_timeout: float = 45 * 60, central_timeout: floa
                     f"{dependency}: {blocked[dependency]}" for dependency, _ in entry.dependencies
                     if dependency in blocked)) for entry in plan.pending]
     results, stopped = [], False
-    for entry in plan.pending:
+    pending = plan.pending
+    states = {entry.module: (" ", "") for entry in pending}
+    took: list[float] = []                     # seconds each released module took, for the estimate
+
+    def show(title: str) -> None:
+        log(f"== {title}")
+        log(render_progress(pending, states))
+
+    show(f"Releasing {len(pending)} module(s), about {format_minutes(seconds_left(0, len(pending) - 1, took))} "
+         "at the usual pace")
+    for position, entry in enumerate(pending, start=1):
         if stopped:
             results.append(Result(entry.module, entry.tag, "not attempted"))
             continue
         started = clock()
+        after_it = len(pending) - position
+        where = f"{position}/{len(pending)}"
+
+        def waiting(what: str, entry=entry, started=started, where=where, after_it=after_it):
+            """The heartbeat of a long wait: what for, for how long, and how much is left."""
+            def beat(_elapsed: float) -> None:
+                elapsed = clock() - started
+                left = format_minutes(seconds_left(elapsed, after_it, took))
+                log(f"   [{where}] {entry.module}: {what} ({format_duration(elapsed)} into this module), "
+                    f"about {left} left")
+            return beat
+
         try:
-            log(f"== {entry.module} {entry.tag}")
+            states[entry.module] = (">", "starting")
+            show(f"{where} {entry.module} {entry.tag}")
             if ops.tag_exists(entry.module, entry.tag):
                 # A release that failed after creating the tag, before reaching Central. The version is
                 # not burned, so it can be released again as long as the tag holds what the plan expects.
@@ -338,26 +398,34 @@ def release(plan: Plan, ops, run_timeout: float = 45 * 60, central_timeout: floa
                     raise ReleaseFailed("a release workflow of this module is already running")
                 log(f"   the tag {entry.tag} exists but {entry.base} is not on Central: releasing it again")
             ops.dispatch(entry.module, entry.tag)
+            states[entry.module] = (">", "release workflow running")
             log("   release workflow started, waiting for it to finish")
-            run = ops.wait_for_run(entry.module, run_timeout)
+            run = ops.wait_for_run(entry.module, run_timeout, waiting("release workflow running"))
             if run is None:
                 raise ReleaseFailed(f"the release workflow did not finish in {int(run_timeout // 60)} minutes")
             if run.conclusion != "success":
                 raise ReleaseFailed(f"the release workflow ended as {run.conclusion}: {run.url}", run.excerpt)
-            log("   workflow finished, waiting for Central to show the version")
-            if not wait_until(lambda: ops.on_central(entry.module, entry.base), central_timeout, clock, sleep):
+            states[entry.module] = (">", "waiting for Central")
+            log(f"   workflow finished in {format_duration(clock() - started)}, waiting for Central to show the version")
+            if not wait_until(lambda: ops.on_central(entry.module, entry.base), central_timeout, clock, sleep,
+                              on_wait=waiting(f"waiting for Central to show {entry.base}")):
                 raise ReleaseFailed(f"Central does not show {entry.base} after {int(central_timeout // 60)} minutes")
+            states[entry.module] = (">", "checking that it resolves from Central")
             problem = ops.resolution_error(entry.module, entry.base)
             if problem is not None:
                 raise ReleaseFailed("it is on Central but cannot be resolved the way a consumer would", problem)
-            results.append(Result(entry.module, entry.tag, "released", run.url, clock() - started))
-            log(f"   released in {(clock() - started) / 60:.1f} minutes")
+            seconds = clock() - started
+            took.append(seconds)
+            results.append(Result(entry.module, entry.tag, "released", run.url, seconds))
+            states[entry.module] = ("x", f"released in {format_duration(seconds)}")
         except ReleaseFailed as error:
             results.append(Result(entry.module, entry.tag, "failed", str(error), clock() - started, error.excerpt))
+            states[entry.module] = ("!", "failed")
             log(f"   STOPPED: {error}")
             for line in error.excerpt.splitlines():
                 log(f"      {line}")
             stopped = True
+    show("Done" if not stopped else "Stopped")
     return results
 
 
@@ -429,7 +497,7 @@ class GitHubOps:
         if result.returncode != 0:
             raise ReleaseFailed(f"cannot start the release workflow: {result.stderr.strip()}")
 
-    def wait_for_run(self, module: str, timeout: float) -> Optional[Run]:
+    def wait_for_run(self, module: str, timeout: float, on_wait=None) -> Optional[Run]:
         repo = f"{ORG}/{module}"
 
         def started() -> bool:
@@ -440,7 +508,7 @@ class GitHubOps:
                 self._run_id = max(recent, key=lambda r: _epoch(r["createdAt"]))["databaseId"]
             return bool(recent)
 
-        if not wait_until(started, 300, self._clock, self._sleep, first=10):
+        if not wait_until(started, 300, self._clock, self._sleep, first=10, on_wait=on_wait):
             raise ReleaseFailed("the release workflow did not start in 5 minutes")
 
         final: dict = {}
@@ -449,7 +517,7 @@ class GitHubOps:
             final.update(self._json("run", "view", str(self._run_id), "-R", repo, "--json", "status,conclusion,url"))
             return final["status"] == "completed"
 
-        if not wait_until(finished, timeout, self._clock, self._sleep, first=30):
+        if not wait_until(finished, timeout, self._clock, self._sleep, first=30, on_wait=on_wait):
             return None
         excerpt = "" if final["conclusion"] == "success" else self._failure_excerpt(repo)
         return Run(final["conclusion"], final["url"], excerpt)

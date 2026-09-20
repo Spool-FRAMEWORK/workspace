@@ -1,5 +1,6 @@
 """Tests for tools/release.py. Run them with: python3 -m unittest discover -s tests -p "*_test.py" """
 import json
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -211,7 +212,7 @@ class FakeOps:
     def dispatch(self, module, tag):
         self.calls.append(("dispatch", module, tag))
 
-    def wait_for_run(self, module, timeout):
+    def wait_for_run(self, module, timeout, on_wait=None):
         self.calls.append(("wait", module))
         outcome = self.fail_at.get(module)
         if outcome == "timeout":
@@ -269,6 +270,99 @@ class WaitUntilTest(unittest.TestCase):
 
         self.assertFalse(release.wait_until(lambda: False, 100, clock, clock.sleep, first=60))
         self.assertLessEqual(clock.now, 100)
+
+
+class ProgressTest(unittest.TestCase):
+    def logged(self, ops=None, **options):
+        lines = []
+        plan = release.build_plan(MODULES, world(after_the_bump()))
+        clock = FakeClock()
+        release.release(plan, ops or FakeOps(central_after=3), log=lines.append, clock=clock, sleep=clock.sleep,
+                        **options)
+        return lines
+
+    def test_durations_are_shown_as_minutes_and_seconds(self):
+        self.assertEqual([release.format_duration(s) for s in (0, 45, 60, 125, 3725)],
+                         ["0s", "45s", "1m 00s", "2m 05s", "62m 05s"])
+
+    def test_the_estimate_uses_the_usual_time_until_a_module_has_been_released(self):
+        usual = release.USUAL_MODULE_SECONDS
+
+        self.assertEqual(release.seconds_left(0, 3, []), 4 * usual)
+        self.assertEqual(release.seconds_left(usual - 60, 1, []), 60 + usual)
+
+    def test_the_estimate_uses_the_pace_of_the_modules_already_released(self):
+        self.assertEqual(release.seconds_left(100, 2, [600, 800]), (700 - 100) + 2 * 700)
+
+    def test_a_module_that_takes_longer_than_usual_is_not_counted_as_negative_time(self):
+        self.assertEqual(release.seconds_left(5000, 0, [600]), 0)
+
+    def test_wait_until_reports_how_long_it_has_been_waiting(self):
+        clock, told = FakeClock(), []
+        answers = iter([False, False, True])
+
+        release.wait_until(lambda: next(answers), 1000, clock, clock.sleep, first=20, factor=2, on_wait=told.append)
+
+        self.assertEqual(told, [0, 20])
+
+    def test_the_checklist_marks_done_in_progress_failed_and_still_to_do(self):
+        entries = release.build_plan(MODULES, world(after_the_bump())).pending
+        states = {"janitor": ("x", "released in 3m 10s"), "infrastructure": (">", "waiting for Central"),
+                  "dsl": ("!", "failed"), "runtime": (" ", "")}
+
+        text = release.render_progress(entries, states)
+
+        self.assertEqual(text.splitlines(), [
+            "   [x] janitor v1.2.1         released in 3m 10s",
+            "   [>] infrastructure v1.2.1  waiting for Central",
+            "   [!] dsl v1.3.0             failed",
+            "   [ ] runtime v1.3.0",
+        ])
+
+    def test_the_release_starts_by_showing_everything_that_is_going_to_be_released(self):
+        lines = self.logged()
+
+        self.assertIn("== Releasing 4 module(s), about 64 min at the usual pace", lines[0])
+        self.assertIn("   [ ] runtime v1.3.0", lines[1])
+
+    def test_the_checklist_is_shown_again_when_a_module_starts_and_at_the_end(self):
+        lines = self.logged()
+
+        self.assertIn("== 2/4 infrastructure v1.2.1", lines)
+        block = lines[lines.index("== 2/4 infrastructure v1.2.1") + 1]
+        self.assertIn("[x] janitor v1.2.1", block)
+        self.assertIn("[>] infrastructure v1.2.1  starting", block)
+        self.assertIn("[ ] dsl v1.3.0", block)
+        self.assertEqual(lines[-2], "== Done")
+        self.assertEqual(lines[-1].count("[x]"), 4)
+
+    def test_a_long_wait_says_what_it_waits_for_for_how_long_and_how_much_is_left(self):
+        lines = self.logged()
+
+        beats = [line for line in lines if "waiting for Central to show 1.2.1" in line and "into this module" in line]
+        self.assertTrue(beats)
+        self.assertRegex(beats[0], r"\[1/4\] janitor: waiting for Central to show 1\.2\.1 "
+                                   r"\((\d+m \d\ds|\d+s) into this module\), about \d+ min left")
+
+    def test_the_estimate_shrinks_as_the_wait_goes_on(self):
+        lines = self.logged(FakeOps(central_after=6))
+
+        left = [int(re.search(r"about (\d+) min left", line).group(1))
+                for line in lines if "[1/4] janitor: waiting for Central" in line]
+        self.assertEqual(left, sorted(left, reverse=True))
+        self.assertGreater(len(set(left)), 1)
+
+    def test_minutes_for_an_estimate_are_rounded_and_never_negative(self):
+        self.assertEqual([release.format_minutes(s) for s in (0, 89, 90, 960, 3840, -5)],
+                         ["0 min", "1 min", "2 min", "16 min", "64 min", "0 min"])
+
+    def test_a_failed_module_is_marked_in_the_final_checklist(self):
+        lines = self.logged(FakeOps(fail_at={"infrastructure": "workflow"}))
+
+        self.assertEqual(lines[-2], "== Stopped")
+        self.assertIn("[!] infrastructure v1.2.1  failed", lines[-1])
+        self.assertIn("[x] janitor v1.2.1", lines[-1])
+        self.assertIn("[ ] dsl v1.3.0", lines[-1])
 
 
 class ReleaseTest(unittest.TestCase):
