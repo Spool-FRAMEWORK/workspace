@@ -90,9 +90,12 @@ is_semver() { printf '%s' "$(base_of "$1")" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$
 level_of() {
     awk -v o="$(base_of "$1")" -v n="$(base_of "$2")" 'BEGIN {
         split(o, a, "."); split(n, b, ".")
-        for (i = 1; i <= 3; i++) if (b[i] + 0 < a[i] + 0) { print "down"; exit }
-        if (b[1] != a[1]) print "major"; else if (b[2] != a[2]) print "minor"
-        else if (b[3] != a[3]) print "patch"; else print "none"
+        part[1] = "major"; part[2] = "minor"; part[3] = "patch"
+        for (i = 1; i <= 3; i++) {
+            if (b[i] + 0 > a[i] + 0) { print part[i]; exit }
+            if (b[i] + 0 < a[i] + 0) { print "down"; exit }
+        }
+        print "none"
     }'
 }
 
