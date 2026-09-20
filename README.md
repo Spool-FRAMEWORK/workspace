@@ -133,8 +133,13 @@ python3 tools/release.py plan
 
 To release, merge `develop` into `main` in each module that changed, then run the workflow. `release.py run` needs
 `GH_TOKEN` to hold a token that can start workflows in the module repositories, which in the workflow is the
-`RELEASE_TOKEN` secret. Publishing to Central cannot be undone, so a failed run is fixed by bumping the version and
-releasing again, never by releasing the same one twice.
+`RELEASE_TOKEN` secret.
+
+If a release stops, the run shows the error lines of the log of the module that failed, so you rarely need to open it.
+A version that never reached Central is not lost: fix the cause (an expired Central token, for instance) and run the
+workflow again. The modules already on Central are skipped, and one whose tag exists but is not on Central is released
+again from that tag as long as the tag holds the version the plan expects. A version that is on Central cannot be
+published again, so a mistake in it is fixed by bumping the version and releasing that one.
 
 ## Working in an IDE
 
