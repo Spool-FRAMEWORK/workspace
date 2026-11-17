@@ -1,0 +1,28 @@
+name: Version check
+
+# Checks every night that the modules on develop are consistent: each dependency asks for the module's real
+# version, and no module has commits on top of a version already on Central, which the release would skip.
+
+on:
+  schedule:
+    - cron: '30 3 * * *'
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: Check the module versions on develop
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: workspace
+
+      - name: Clone the modules on develop
+        working-directory: workspace
+        run: sh ./bootstrap.sh
+
+      - name: Check that the module versions are consistent and not already published
+        working-directory: workspace
+        run: sh ./bump.sh --check
