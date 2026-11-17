@@ -3,6 +3,7 @@
 
     python3 tools/release.py plan       what would be released, in which order, and what is wrong
     python3 tools/release.py run --yes  release every pending module, one after the other
+    python3 tools/release.py push       push develop of every module in dependency order (tools/develop_push.py)
 
 A module is pending when the base version of its pom on main, without -SNAPSHOT, is not on Central yet.
 Modules are ordered so that each one comes after the ones it depends on: a module published against a
@@ -38,6 +39,17 @@ RELEASE_BRANCH = "main"
 DEVELOPMENT_BRANCH = "develop"
 
 NOT_ON_CENTRAL = {"watchdog": "it is published as a Docker image"}
+
+
+@dataclass(frozen=True)
+class Workflow:
+    """A workflow every module has, and the branch it runs on."""
+    file: str
+    branch: str
+
+
+RELEASE_WORKFLOW = Workflow("release.yml", RELEASE_BRANCH)
+PUBLISH_WORKFLOW = Workflow("publish-develop.yml", DEVELOPMENT_BRANCH)
 
 _CENTRAL_ONLY = (
     "<settings><mirrors><mirror><id>central-only</id><mirrorOf>*</mirrorOf>"
@@ -146,12 +158,11 @@ class Plan:
         return [f"{entry.module}: {problem}" for entry in self.entries for problem in entry.problems]
 
 
-def dependency_order(entries: dict[str, Entry], modules: list[str]) -> list[str]:
+def dependency_order(dependencies: dict[str, list[str]], modules: list[str]) -> list[str]:
     """Each module after the ones it depends on. Ties keep the order of the module list."""
     remaining, ordered = list(modules), []
     while remaining:
-        ready = [m for m in remaining
-                 if not any(dep in remaining for dep, _ in entries[m].dependencies if dep in entries)]
+        ready = [m for m in remaining if not any(dep in remaining for dep in dependencies[m])]
         if not ready:
             raise ValueError("circular dependency between: " + ", ".join(remaining))
         ordered.append(ready[0])
@@ -195,7 +206,8 @@ def build_plan(modules: list[str], fetch: Fetch) -> Plan:
             develop_version=parse_pom(develop)[1] if develop else None,
             skipped=skipped,
         )
-    ordered = [entries[m] for m in dependency_order(entries, modules)]
+    dependencies = {m: [dep for dep, _ in entry.dependencies] for m, entry in entries.items()}
+    ordered = [entries[m] for m in dependency_order(dependencies, modules)]
     for entry in ordered:
         check(entry, entries)
     return Plan(ordered)
@@ -243,17 +255,35 @@ class ReleaseFailed(Exception):
 
 @dataclass
 class Run:
-    """How a release workflow ended, and the error lines of its log when it did not succeed."""
+    """How a workflow run ended, and the error lines of its log when it did not succeed."""
     conclusion: str
     url: str
     excerpt: str = ""
 
 
 @dataclass
+class PublishState:
+    """The latest publish-develop run of a module: its status, its conclusion once completed, and where it is."""
+    status: str
+    conclusion: str
+    url: str
+
+    @property
+    def running(self) -> bool:
+        return self.status != "completed"
+
+    @property
+    def succeeded(self) -> bool:
+        return self.status == "completed" and self.conclusion == "success"
+
+
+@dataclass
 class Result:
-    """What happened to a module: released, failed or not attempted."""
+    """What happened to a module: released, failed or not attempted.
+
+    label says which version of the module it is about: the tag of a release, the version of a push."""
     module: str
-    tag: str
+    label: str
     outcome: str
     detail: str = ""
     seconds: float = 0.0
@@ -322,12 +352,12 @@ def seconds_left(current_elapsed: float, after_it: int, took: list[float]) -> fl
     return max(usual - current_elapsed, 0) + after_it * usual
 
 
-def render_progress(entries: list[Entry], states: dict[str, tuple[str, str]]) -> str:
-    """A checklist of the modules to release: [x] done, [>] in progress, [!] failed and [ ] still to do."""
-    width = max(len(f"{entry.module} {entry.tag}") for entry in entries)
+def render_progress(modules: list[tuple[str, str]], states: dict[str, tuple[str, str]]) -> str:
+    """A checklist of (module, label) pairs: [x] done, [>] in progress, [!] failed and [ ] still to do."""
+    width = max(len(f"{module} {label}") for module, label in modules)
     return "\n".join(
-        f"   [{states[entry.module][0]}] {f'{entry.module} {entry.tag}'.ljust(width)}  {states[entry.module][1]}".rstrip()
-        for entry in entries)
+        f"   [{states[module][0]}] {f'{module} {label}'.ljust(width)}  {states[module][1]}".rstrip()
+        for module, label in modules)
 
 
 def unpublished_dependencies(plan: Plan, ops) -> dict[str, str]:
@@ -368,7 +398,7 @@ def release(plan: Plan, ops, run_timeout: float = 45 * 60, central_timeout: floa
 
     def show(title: str) -> None:
         log(f"== {title}")
-        log(render_progress(pending, states))
+        log(render_progress([(entry.module, entry.tag) for entry in pending], states))
 
     show(f"Releasing {len(pending)} module(s), about {format_minutes(seconds_left(0, len(pending) - 1, took))} "
          "at the usual pace")
@@ -432,8 +462,12 @@ def release(plan: Plan, ops, run_timeout: float = 45 * 60, central_timeout: floa
 
 
 def render_results(results: list[Result], markdown: bool = False) -> str:
-    rows = [(r.module, r.tag, r.outcome, f"{r.seconds / 60:.1f}" if r.seconds else "", r.detail) for r in results]
-    return "\n".join(_table(("Module", "Tag", "Outcome", "Minutes", "Detail"), rows, markdown))
+    return render_result_table(results, "Tag", markdown)
+
+
+def render_result_table(results: list[Result], label: str, markdown: bool = False) -> str:
+    rows = [(r.module, r.label, r.outcome, f"{r.seconds / 60:.1f}" if r.seconds else "", r.detail) for r in results]
+    return "\n".join(_table(("Module", label, "Outcome", "Minutes", "Detail"), rows, markdown))
 
 
 def render_excerpts(results: list[Result], markdown: bool = False) -> str:
@@ -442,7 +476,7 @@ def render_excerpts(results: list[Result], markdown: bool = False) -> str:
     for result in results:
         if result.excerpt:
             body = f"```\n{result.excerpt}\n```" if markdown else result.excerpt
-            blocks.append(f"{result.module} {result.tag}\n{body}")
+            blocks.append(f"{result.module} {result.label}\n{body}")
     return "\n\n".join(blocks)
 
 
@@ -451,10 +485,14 @@ def _epoch(timestamp: str) -> float:
 
 
 class GitHubOps:
-    """What the release does to the world: GitHub through the gh CLI, and Maven Central over HTTPS."""
+    """What the release does to the world: GitHub through the gh CLI, and Maven Central over HTTPS.
 
-    def __init__(self, run=subprocess.run, exists=http_exists, clock=time.time, sleep=time.sleep):
+    workflow is the one it starts and waits for: the release of each module by default."""
+
+    def __init__(self, run=subprocess.run, exists=http_exists, clock=time.time, sleep=time.sleep,
+                 workflow: Workflow = RELEASE_WORKFLOW):
         self._run, self._exists, self._clock, self._sleep = run, exists, clock, sleep
+        self._workflow = workflow
         self._dispatched_at = 0.0
         self._run_id = None
 
@@ -487,33 +525,40 @@ class GitHubOps:
             raise ReleaseFailed(f"cannot read the version at tag {tag}: {error}")
 
     def running(self, module: str) -> bool:
-        """Whether a release workflow of the module is queued or in progress."""
+        """Whether a run of the workflow is queued or in progress in the module."""
         for status in ("queued", "in_progress"):
-            if self._json("run", "list", "-R", f"{ORG}/{module}", "--workflow", "release.yml",
+            if self._json("run", "list", "-R", f"{ORG}/{module}", "--workflow", self._workflow.file,
                           "--status", status, "--json", "databaseId"):
                 return True
         return False
 
-    def dispatch(self, module: str, tag: str) -> None:
+    def dispatch(self, module: str, tag: Optional[str] = None) -> None:
+        """Starts the workflow in the module, with the tag to release when there is one."""
         self._dispatched_at = self._clock()
-        result = self._gh("workflow", "run", "release.yml", "-R", f"{ORG}/{module}",
-                          "--ref", RELEASE_BRANCH, "-f", f"tag={tag}")
+        inputs = ["-f", f"tag={tag}"] if tag else []
+        result = self._gh("workflow", "run", self._workflow.file, "-R", f"{ORG}/{module}",
+                          "--ref", self._workflow.branch, *inputs)
         if result.returncode != 0:
-            raise ReleaseFailed(f"cannot start the release workflow: {result.stderr.strip()}")
+            raise ReleaseFailed(f"cannot start {self._workflow.file}: {result.stderr.strip()}")
 
-    def wait_for_run(self, module: str, timeout: float, on_wait=None) -> Optional[Run]:
+    def wait_for_run(self, module: str, timeout: float, on_wait=None, commit: Optional[str] = None) -> Optional[Run]:
+        """Waits for the run started by the last dispatch, or for the one a push of the commit started."""
         repo = f"{ORG}/{module}"
+        if commit:
+            which = ["--commit", commit]
+        else:
+            which = ["--event", "workflow_dispatch"]
 
         def started() -> bool:
-            runs = self._json("run", "list", "-R", repo, "--workflow", "release.yml", "--event",
-                              "workflow_dispatch", "--limit", "10", "--json", "databaseId,createdAt")
-            recent = [r for r in runs if _epoch(r["createdAt"]) >= self._dispatched_at - 60]
+            runs = self._json("run", "list", "-R", repo, "--workflow", self._workflow.file, *which,
+                              "--limit", "10", "--json", "databaseId,createdAt")
+            recent = runs if commit else [r for r in runs if _epoch(r["createdAt"]) >= self._dispatched_at - 60]
             if recent:
                 self._run_id = max(recent, key=lambda r: _epoch(r["createdAt"]))["databaseId"]
             return bool(recent)
 
         if not wait_until(started, 300, self._clock, self._sleep, first=10, on_wait=on_wait):
-            raise ReleaseFailed("the release workflow did not start in 5 minutes")
+            raise ReleaseFailed(f"{self._workflow.file} did not start in 5 minutes")
 
         final: dict = {}
 
@@ -535,17 +580,23 @@ class GitHubOps:
         base = f"{CENTRAL}/{GROUP_PATH}/{module}/{version}/{module}-{version}"
         return self._exists(base + ".pom") and self._exists(base + ".jar")
 
+    def latest_publish(self, module: str) -> Optional[PublishState]:
+        """The latest publish of the module from develop, or None when it was never published from there."""
+        runs = self._json("run", "list", "-R", f"{ORG}/{module}", "--workflow", PUBLISH_WORKFLOW.file,
+                          "--branch", PUBLISH_WORKFLOW.branch, "--limit", "1", "--json", "status,conclusion,url")
+        if not runs:
+            return None
+        return PublishState(runs[0]["status"], runs[0]["conclusion"], runs[0]["url"])
+
     def snapshot_problem(self, module: str) -> Optional[str]:
         """Why the last publish of the module from develop did not leave its SNAPSHOT in GitHub Packages."""
-        runs = self._json("run", "list", "-R", f"{ORG}/{module}", "--workflow", "publish-develop.yml",
-                          "--branch", DEVELOPMENT_BRANCH, "--limit", "1", "--json", "status,conclusion,url")
-        if not runs:
-            return f"it was never published from {DEVELOPMENT_BRANCH}"
-        run = runs[0]
-        if run["status"] != "completed":
-            return f"its latest publish is still {run['status']}: {run['url']}"
-        if run["conclusion"] != "success":
-            return f"its latest publish ended as {run['conclusion']}: {run['url']}"
+        publish = self.latest_publish(module)
+        if publish is None:
+            return f"it was never published from {PUBLISH_WORKFLOW.branch}"
+        if publish.running:
+            return f"its latest publish is still {publish.status}: {publish.url}"
+        if not publish.succeeded:
+            return f"its latest publish ended as {publish.conclusion}: {publish.url}"
         return None
 
     def resolution_error(self, module: str, version: str) -> Optional[str]:
@@ -648,6 +699,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     run.add_argument("--run-timeout", type=int, default=45, help="minutes to wait for each release workflow")
     run.add_argument("--central-timeout", type=int, default=60, help="minutes to wait for Central to show a version")
     run.set_defaults(handler=command_run)
+
+    import develop_push
+    develop_push.add_command(commands)
 
     args = parser.parse_args(argv)
     return args.handler(args)

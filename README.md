@@ -119,6 +119,33 @@ force the part that grows in the dependents. Nothing is committed: review and co
 `bump.sh` needs a POSIX shell, so on Windows use Git Bash or WSL. CI runs `./bump.sh --check` on every change to this
 repository, and the **Version check** workflow runs it every night on the `develop` branch of every module.
 
+`./bump.sh --check --porcelain` prints only the problems, one per line as `<module><TAB><problem>`, with an empty
+module for a problem that is about no module in particular. It is meant for tools.
+
+## Pushing develop
+
+Every push to `develop` starts the `publish-develop` workflow of that module, which puts its SNAPSHOT in GitHub
+Packages. When several modules are pushed at once, their workflows start together and the ones that depend on another
+fail, because that SNAPSHOT is not there yet. Push them in order instead:
+
+```bash
+python3 tools/release.py push --dry-run   # what would be pushed, published again or skipped, and why
+python3 tools/release.py push             # the same, then it asks before pushing anything
+```
+
+It goes through the modules in dependency order and pushes the next one only after the publish of the one before
+has ended well. For each module:
+
+- **New commits**: it is pushed, and its publish is waited for.
+- **No new commits, but its last publish failed**: it is published again, without a push.
+- **Nothing new and published**: it is left alone.
+- **Cannot be pushed**: not on `develop`, uncommitted changes, behind or diverged from `origin/develop`, or a problem
+  in `./bump.sh --check`. It is skipped when nothing that is pushed depends on it. When something does, nothing is
+  pushed at all, and the plan says which module blocks and why.
+
+The first publish that fails stops it, with the error lines of its log. It runs on your machine with your clones,
+so it needs `git` and `gh` logged in with access to the module repositories.
+
 ## Releases
 
 Releasing is done by GitHub Actions, not from anybody's machine, so it works the same for every developer. Go to

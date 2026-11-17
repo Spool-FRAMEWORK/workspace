@@ -314,7 +314,7 @@ class ProgressTest(unittest.TestCase):
         states = {"janitor": ("x", "released in 3m 10s"), "infrastructure": (">", "waiting for Central"),
                   "dsl": ("!", "failed"), "runtime": (" ", "")}
 
-        text = release.render_progress(entries, states)
+        text = release.render_progress([(entry.module, entry.tag) for entry in entries], states)
 
         self.assertEqual(text.splitlines(), [
             "   [x] janitor v1.2.1         released in 3m 10s",
