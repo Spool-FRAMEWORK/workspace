@@ -4,11 +4,14 @@
 #   ./bump.sh janitor 1.3.0-SNAPSHOT     set janitor's version and bump its dependents
 #   ./bump.sh janitor 1.3.0 --dry-run    show the plan without touching any file
 #   ./bump.sh janitor 1.3.0 --patch      bump the dependents by a patch whatever the change was
-#   ./bump.sh --check                    verify that every dependency matches the module's real version
+#   ./bump.sh --check                    verify that every dependency matches the module's real version, and that
+#                                        no module has commits on top of a version already on Central
+#   ./bump.sh --align                    rewrite every dependency to the module's real version (also --dry-run)
 #
 # The part of the version that grows in the module you change (major, minor or patch) is the part that
 # grows in each of its dependents, and their dependency references are rewritten to match.
 # Nothing is committed: review and commit each repository yourself.
+# SPOOL_CENTRAL_URL changes the Maven repository --check reads, https://repo1.maven.org/maven2 by default.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -16,6 +19,7 @@ root=$(dirname "$here")
 module=""
 new=""
 check=0
+align=0
 dry=0
 yes=0
 force_level=""
@@ -25,10 +29,11 @@ die() { echo "$*" >&2; exit 1; }
 for arg in "$@"; do
     case "$arg" in
         --check)                check=1 ;;
+        --align)                align=1 ;;
         --dry-run)              dry=1 ;;
         --yes)                  yes=1 ;;
         --major|--minor|--patch) force_level=${arg#--} ;;
-        -h|--help)              sed -n '2,10p' "$0"; exit 0 ;;
+        -h|--help)              sed -n '2,14p' "$0"; exit 0 ;;
         -*)                     die "Unknown option: $arg" ;;
         *)
             if [ -z "$module" ]; then module="$arg"
@@ -38,6 +43,8 @@ for arg in "$@"; do
     esac
 done
 
+central_url=${SPOOL_CENTRAL_URL:-https://repo1.maven.org/maven2}
+group_path=io/github/spool-framework
 modules=$(sed -n 's|.*<module>\.\./\([^<]*\)</module>.*|\1|p' "$here/pom.xml")
 
 for m in $modules; do
@@ -119,30 +126,114 @@ dependents_of() {
         | grep -vx "$1" || true
 }
 
-run_check() {
+# Prints "<module> <dependency> <version it asks for> <real version>" for every dependency on a Spool module
+# that does not ask for that module's real version.
+misaligned_dependencies() {
     for m in $modules; do
         triplets "$root/$m/pom.xml" | awk -v m="$m" 'NR == 1 { print "own", m, $1, $2; next } { print "dep", m, $1, $2 }'
     done | awk '
-        $1 == "own" { ver[$3] = $4; count++; next }
+        $1 == "own" { ver[$3] = $4; next }
         $1 == "dep" { n++; dm[n] = $2; da[n] = $3; dv[n] = $4 }
         END {
-            bad = 0
             for (i = 1; i <= n; i++)
-                if ((da[i] in ver) && dv[i] != ver[da[i]]) {
-                    printf "%s depends on %s %s, but %s is %s\n", dm[i], da[i], dv[i], da[i], ver[da[i]]
-                    bad++
-                }
-            if (bad) exit 1
-            printf "Versions are consistent across %d modules\n", count
+                if ((da[i] in ver) && dv[i] != ver[da[i]]) print dm[i], da[i], dv[i], ver[da[i]]
         }'
 }
 
+run_check() {
+    misaligned=$(misaligned_dependencies)
+    if [ -n "$misaligned" ]; then
+        printf '%s\n' "$misaligned" | awk '{ printf "%s depends on %s %s, but %s is %s\n", $1, $2, $3, $2, $4 }'
+        echo "Run ./bump.sh --align to make every dependency ask for the module's real version."
+        return 1
+    fi
+    echo "Versions are consistent across $(printf '%s\n' $modules | wc -l | tr -d ' ') modules"
+}
+
+# Prints the versions of a module on Central, one per line, and nothing when it was never published there.
+# Fails when Central cannot be read, so that an unreachable Central is never taken as "not published".
+central_versions_of() {
+    response=$(curl -sSL -w '\n%{http_code}' "$central_url/$group_path/$1/maven-metadata.xml" 2>&1) || return 1
+    case "$(printf '%s\n' "$response" | tail -n 1)" in
+        404) return 0 ;;
+        200|000) printf '%s\n' "$response" | sed '$d' | grep -o '<version>[^<]*</version>' | sed 's|<[^>]*>||g' ;;
+        *) return 1 ;;
+    esac
+}
+
+# A module whose version is already on Central must not get new commits under that version: the release
+# would skip it, because Central does not let a version be published again.
+run_publication_check() {
+    stale=0
+    for m in $modules; do
+        version=$(version_of "$m")
+        base=$(base_of "$version")
+        if ! published=$(central_versions_of "$m"); then
+            echo "Cannot read the versions of $m on Central ($central_url/$group_path/$m/maven-metadata.xml)"
+            stale=$((stale + 1))
+            continue
+        fi
+        printf '%s\n' "$published" | grep -qxF "$base" || continue
+        if ! git -C "$root/$m" rev-parse -q --verify "refs/tags/v$base" > /dev/null; then
+            echo "$m is at $version, which is on Central, but its clone has no tag v$base: run git fetch --tags in $m"
+            stale=$((stale + 1))
+            continue
+        fi
+        commits=$(git -C "$root/$m" rev-list --count "v$base..HEAD")
+        if [ "$commits" -gt 0 ]; then
+            echo "$m has $commits commit(s) after v$base, and $base is already on Central: give it a new version, for instance ./bump.sh $m $(bump_of "$version" patch)"
+            stale=$((stale + 1))
+        fi
+    done
+    [ "$stale" -eq 0 ] || return 1
+    echo "No module has commits on top of a version already on Central"
+}
+
+run_align() {
+    misaligned=$(misaligned_dependencies)
+    if [ -z "$misaligned" ]; then
+        echo "Every dependency already asks for the module's real version."
+        return 0
+    fi
+    echo "Plan:"
+    printf '%s\n' "$misaligned" | awk '{ printf "%s: %s %s -> %s\n", $1, $2, $3, $4 }'
+    if [ "$dry" -eq 1 ]; then
+        echo "Dry run: no file was changed."
+        return 0
+    fi
+    map=""
+    for m in $modules; do
+        map="$map $(triplets "$root/$m/pom.xml" | head -1 | tr ' ' '=')"
+    done
+    for m in $modules; do
+        apply_versions "$root/$m/pom.xml" "$map"
+    done
+    echo
+    run_check || die "The versions are still inconsistent after aligning them."
+    show_changed_files
+}
+
+show_changed_files() {
+    echo
+    echo "Changed files (nothing was committed):"
+    for m in $modules; do
+        git -C "$root/$m" diff --stat -- pom.xml 2>/dev/null || true
+    done
+}
+
 if [ "$check" -eq 1 ]; then
-    run_check || exit 1
+    failed=0
+    run_check || failed=1
+    run_publication_check || failed=1
+    exit "$failed"
+fi
+
+if [ "$align" -eq 1 ]; then
+    run_align
     exit 0
 fi
 
-[ -n "$module" ] && [ -n "$new" ] || die "Usage: ./bump.sh <module> <new-version> [--dry-run] [--yes] [--patch|--minor|--major]   or   ./bump.sh --check"
+[ -n "$module" ] && [ -n "$new" ] || die "Usage: ./bump.sh <module> <new-version> [--dry-run] [--yes] [--patch|--minor|--major]   or   ./bump.sh --check   or   ./bump.sh --align [--dry-run]"
 printf '%s\n' "$modules" | grep -qx "$module" || die "Unknown module '$module'. Known modules: $(printf '%s' "$modules" | tr '\n' ' ')"
 is_semver "$new" || die "'$new' is not a version like 1.3.0 or 1.3.0-SNAPSHOT"
 
@@ -183,8 +274,4 @@ done
 
 echo
 run_check || die "The versions are still inconsistent after applying the plan."
-echo
-echo "Changed files (nothing was committed):"
-for m in $modules; do
-    git -C "$root/$m" diff --stat -- pom.xml 2>/dev/null || true
-done
+show_changed_files

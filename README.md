@@ -98,7 +98,8 @@ that depend on it change too. `bump.sh` does that for you:
 ```bash
 ./bump.sh janitor 1.3.0-SNAPSHOT     # set janitor's version, its dependents follow
 ./bump.sh janitor 1.3.0 --dry-run    # show the plan without touching any file
-./bump.sh --check                    # verify every dependency matches the module's real version
+./bump.sh --check                    # verify the versions, see below
+./bump.sh --align                    # rewrite every dependency to the module's real version
 ```
 
 The part that grows in the module you change (major, minor or patch) is the part that grows in each module that depends
@@ -106,8 +107,17 @@ on it. If `janitor` goes from 1.2.1 to 1.3.0 (a minor), `infrastructure` 1.3.0 b
 1.5.0, and their dependencies on `janitor` are rewritten to the new version. Pass `--patch`, `--minor` or `--major` to
 force the part that grows in the dependents. Nothing is committed: review and commit each repository yourself.
 
-`bump.sh` needs a POSIX shell, so on Windows use Git Bash or WSL. CI runs `./bump.sh --check` to catch versions that
-drift apart.
+`./bump.sh --check` fails in two cases:
+
+- A dependency does not ask for the module's real version, which happens when a version is changed by hand in a
+  `pom.xml`. `./bump.sh --align` rewrites every dependency to the real version (`--dry-run` shows the plan first).
+- A module has commits after the tag of its version, and that version is already on Maven Central. The release would
+  skip it, because a version cannot be published twice: give it a new version with `./bump.sh`. It reads Central, so
+  it needs a network connection, and it fails when Central cannot be reached. `SPOOL_CENTRAL_URL` points it at another
+  Maven repository.
+
+`bump.sh` needs a POSIX shell, so on Windows use Git Bash or WSL. CI runs `./bump.sh --check` on every change to this
+repository, and the **Version check** workflow runs it every night on the `develop` branch of every module.
 
 ## Releases
 
