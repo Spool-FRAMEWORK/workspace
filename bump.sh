@@ -7,7 +7,9 @@
 #   ./bump.sh --check                    verify that every dependency matches the module's real version, that
 #                                        no module has commits on top of a version already on Central, and that
 #                                        every module that uses Cucumber asks for the same cucumber.version
-#   ./bump.sh --align                    rewrite every dependency to the module's real version (also --dry-run)
+#   ./bump.sh --check --porcelain        the same, printing only the problems as "<module><TAB><problem>",
+#                                        with an empty module for a problem that is about no module in particular
+#   ./bump.sh --align                   rewrite every dependency to the module's real version (also --dry-run)
 #
 # The part of the version that grows in the module you change (major, minor or patch) is the part that
 # grows in each of its dependents, and their dependency references are rewritten to match.
@@ -20,6 +22,7 @@ root=$(dirname "$here")
 module=""
 new=""
 check=0
+porcelain=0
 align=0
 dry=0
 yes=0
@@ -27,14 +30,26 @@ force_level=""
 
 die() { echo "$*" >&2; exit 1; }
 
+# The problems --check finds come in as "<module><TAB><problem>" lines. --porcelain keeps them like that, so
+# a tool can tell which module each one is about; otherwise only the problem is shown.
+report() {
+    if [ "$porcelain" -eq 1 ]; then cat; else cut -f2-; fi
+}
+
+# What only a person needs: advice and what went fine. --porcelain leaves it out.
+say() {
+    [ "$porcelain" -eq 1 ] || printf '%s\n' "$*"
+}
+
 for arg in "$@"; do
     case "$arg" in
         --check)                check=1 ;;
+        --porcelain)            porcelain=1 ;;
         --align)                align=1 ;;
         --dry-run)              dry=1 ;;
         --yes)                  yes=1 ;;
         --major|--minor|--patch) force_level=${arg#--} ;;
-        -h|--help)              sed -n '2,15p' "$0"; exit 0 ;;
+        -h|--help)              sed -n '2,17p' "$0"; exit 0 ;;
         -*)                     die "Unknown option: $arg" ;;
         *)
             if [ -z "$module" ]; then module="$arg"
@@ -144,11 +159,12 @@ misaligned_dependencies() {
 run_check() {
     misaligned=$(misaligned_dependencies)
     if [ -n "$misaligned" ]; then
-        printf '%s\n' "$misaligned" | awk '{ printf "%s depends on %s %s, but %s is %s\n", $1, $2, $3, $2, $4 }'
-        echo "Run ./bump.sh --align to make every dependency ask for the module's real version."
+        printf '%s\n' "$misaligned" \
+            | awk '{ printf "%s\t%s depends on %s %s, but %s is %s\n", $1, $1, $2, $3, $2, $4 }' | report
+        say "Run ./bump.sh --align to make every dependency ask for the module's real version."
         return 1
     fi
-    echo "Versions are consistent across $(printf '%s\n' $modules | wc -l | tr -d ' ') modules"
+    say "Versions are consistent across $(printf '%s\n' $modules | wc -l | tr -d ' ') modules"
 }
 
 # Prints the versions of a module on Central, one per line, and nothing when it was never published there.
@@ -170,24 +186,27 @@ run_publication_check() {
         version=$(version_of "$m")
         base=$(base_of "$version")
         if ! published=$(central_versions_of "$m"); then
-            echo "Cannot read the versions of $m on Central ($central_url/$group_path/$m/maven-metadata.xml)"
+            printf '%s\t%s\n' "$m" \
+                "Cannot read the versions of $m on Central ($central_url/$group_path/$m/maven-metadata.xml)" | report
             stale=$((stale + 1))
             continue
         fi
         printf '%s\n' "$published" | grep -qxF "$base" || continue
         if ! git -C "$root/$m" rev-parse -q --verify "refs/tags/v$base" > /dev/null; then
-            echo "$m is at $version, which is on Central, but its clone has no tag v$base: run git fetch --tags in $m"
+            printf '%s\t%s\n' "$m" \
+                "$m is at $version, which is on Central, but its clone has no tag v$base: run git fetch --tags in $m" | report
             stale=$((stale + 1))
             continue
         fi
         commits=$(git -C "$root/$m" rev-list --count "v$base..HEAD")
         if [ "$commits" -gt 0 ]; then
-            echo "$m has $commits commit(s) after v$base, and $base is already on Central: give it a new version, for instance ./bump.sh $m $(bump_of "$version" patch)"
+            printf '%s\t%s\n' "$m" \
+                "$m has $commits commit(s) after v$base, and $base is already on Central: give it a new version, for instance ./bump.sh $m $(bump_of "$version" patch)" | report
             stale=$((stale + 1))
         fi
     done
     [ "$stale" -eq 0 ] || return 1
-    echo "No module has commits on top of a version already on Central"
+    say "No module has commits on top of a version already on Central"
 }
 
 # Prints "<module> <version>" for every module that sets a cucumber.version property.
@@ -203,11 +222,13 @@ run_cucumber_check() {
     versions=$(cucumber_versions)
     [ -n "$versions" ] || return 0
     if [ "$(printf '%s\n' "$versions" | awk '{ print $2 }' | sort -u | wc -l)" -gt 1 ]; then
-        printf '%s\n' "$versions" | awk '{ list = list sep $1 " " $2; sep = ", " } END { print "Modules use different Cucumber versions: " list }'
-        echo "Set the same cucumber.version in all of them."
+        printf '%s\n' "$versions" \
+            | awk '{ list = list sep $1 " " $2; sep = ", " } END { print "\tModules use different Cucumber versions: " list }' \
+            | report
+        say "Set the same cucumber.version in all of them."
         return 1
     fi
-    echo "Cucumber $(printf '%s\n' "$versions" | awk 'NR == 1 { print $2 }') in $(printf '%s\n' "$versions" | wc -l | tr -d ' ') module(s)"
+    say "Cucumber $(printf '%s\n' "$versions" | awk 'NR == 1 { print $2 }') in $(printf '%s\n' "$versions" | wc -l | tr -d ' ') module(s)"
 }
 
 run_align() {

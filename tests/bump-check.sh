@@ -153,6 +153,30 @@ uses_cucumber janitor 7.18.0
 run_bump --check
 expect_failure_saying "Modules use different Cucumber versions: core 7.20.1, janitor 7.18.0"
 
+tab=$(printf '\t')
+
+new_world porcelain_consistent
+run_bump --check --porcelain
+expect_success
+[ -z "$output" ] || fail "expected no output when everything is fine, got: $output"
+
+new_world porcelain_names_the_module_of_each_problem
+module_pom core 1.3.0-SNAPSHOT > "$world/core/pom.xml"
+echo "change" > "$world/janitor/change.txt"
+commit_all "$world/janitor" "feat: change after the release"
+run_bump --check --porcelain
+expect_failure_saying "janitor${tab}janitor depends on core 1.2.0-SNAPSHOT, but core is 1.3.0-SNAPSHOT"
+expect_failure_saying "janitor${tab}janitor has 1 commit(s) after v1.2.0, and 1.2.0 is already on Central"
+[ "$(printf '%s\n' "$output" | grep -vc "$tab")" -eq 0 ] || fail "expected only problem lines, got: $output"
+
+new_world porcelain_problem_of_no_module
+uses_cucumber core 7.20.1
+uses_cucumber janitor 7.18.0
+run_bump --check --porcelain
+[ "$status" -ne 0 ] || fail "expected a failure, it passed: $output"
+[ "$output" = "${tab}Modules use different Cucumber versions: core 7.20.1, janitor 7.18.0" ] \
+    || fail "expected the Cucumber problem with an empty module, got: $output"
+
 new_world align_dry_run
 module_pom core 1.3.0-SNAPSHOT > "$world/core/pom.xml"
 before=$(cat "$world/janitor/pom.xml")
