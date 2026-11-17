@@ -4,8 +4,9 @@
 #   ./bump.sh janitor 1.3.0-SNAPSHOT     set janitor's version and bump its dependents
 #   ./bump.sh janitor 1.3.0 --dry-run    show the plan without touching any file
 #   ./bump.sh janitor 1.3.0 --patch      bump the dependents by a patch whatever the change was
-#   ./bump.sh --check                    verify that every dependency matches the module's real version, and that
-#                                        no module has commits on top of a version already on Central
+#   ./bump.sh --check                    verify that every dependency matches the module's real version, that
+#                                        no module has commits on top of a version already on Central, and that
+#                                        every module that uses Cucumber asks for the same cucumber.version
 #   ./bump.sh --align                    rewrite every dependency to the module's real version (also --dry-run)
 #
 # The part of the version that grows in the module you change (major, minor or patch) is the part that
@@ -33,7 +34,7 @@ for arg in "$@"; do
         --dry-run)              dry=1 ;;
         --yes)                  yes=1 ;;
         --major|--minor|--patch) force_level=${arg#--} ;;
-        -h|--help)              sed -n '2,14p' "$0"; exit 0 ;;
+        -h|--help)              sed -n '2,15p' "$0"; exit 0 ;;
         -*)                     die "Unknown option: $arg" ;;
         *)
             if [ -z "$module" ]; then module="$arg"
@@ -189,6 +190,26 @@ run_publication_check() {
     echo "No module has commits on top of a version already on Central"
 }
 
+# Prints "<module> <version>" for every module that sets a cucumber.version property.
+cucumber_versions() {
+    for m in $modules; do
+        version=$(sed -n 's|.*<cucumber.version>\([^<]*\)</cucumber.version>.*|\1|p' "$root/$m/pom.xml" | head -1)
+        if [ -n "$version" ]; then echo "$m $version"; fi
+    done
+}
+
+# Each module declares Cucumber on its own (ADR-017), so nothing else keeps their versions together.
+run_cucumber_check() {
+    versions=$(cucumber_versions)
+    [ -n "$versions" ] || return 0
+    if [ "$(printf '%s\n' "$versions" | awk '{ print $2 }' | sort -u | wc -l)" -gt 1 ]; then
+        printf '%s\n' "$versions" | awk '{ list = list sep $1 " " $2; sep = ", " } END { print "Modules use different Cucumber versions: " list }'
+        echo "Set the same cucumber.version in all of them."
+        return 1
+    fi
+    echo "Cucumber $(printf '%s\n' "$versions" | awk 'NR == 1 { print $2 }') in $(printf '%s\n' "$versions" | wc -l | tr -d ' ') module(s)"
+}
+
 run_align() {
     misaligned=$(misaligned_dependencies)
     if [ -z "$misaligned" ]; then
@@ -225,6 +246,7 @@ if [ "$check" -eq 1 ]; then
     failed=0
     run_check || failed=1
     run_publication_check || failed=1
+    run_cucumber_check || failed=1
     exit "$failed"
 fi
 

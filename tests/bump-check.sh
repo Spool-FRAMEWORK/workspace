@@ -83,6 +83,11 @@ EOF
     central_url="file://$(cd "$central" && { pwd -W 2>/dev/null || pwd; })"
 }
 
+# Gives a module a cucumber.version property, without committing it.
+uses_cucumber() {
+    sed -i "s|</project>|<properties><cucumber.version>$2</cucumber.version></properties></project>|" "$world/$1/pom.xml"
+}
+
 run_bump() {
     output=$(SPOOL_CENTRAL_URL="$central_url" sh "$world/workspace/bump.sh" "$@" 2>&1)
     status=$?
@@ -128,6 +133,23 @@ central_url="file://$scratch/missing-central"
 rm -rf "$central"
 run_bump --check
 expect_failure_saying "Cannot read the versions of core on Central"
+
+new_world cucumber_same_version
+uses_cucumber core 7.20.1
+uses_cucumber janitor 7.20.1
+run_bump --check
+expect_success
+
+new_world cucumber_only_in_some_modules
+uses_cucumber janitor 7.20.1
+run_bump --check
+expect_success
+
+new_world cucumber_versions_differ
+uses_cucumber core 7.20.1
+uses_cucumber janitor 7.18.0
+run_bump --check
+expect_failure_saying "Modules use different Cucumber versions: core 7.20.1, janitor 7.18.0"
 
 new_world align_dry_run
 module_pom core 1.3.0-SNAPSHOT > "$world/core/pom.xml"
