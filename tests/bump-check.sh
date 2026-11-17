@@ -85,7 +85,9 @@ EOF
 
 # Gives a module a cucumber.version property, without committing it.
 uses_cucumber() {
-    sed -i "s|</project>|<properties><cucumber.version>$2</cucumber.version></properties></project>|" "$world/$1/pom.xml"
+    pom="$world/$1/pom.xml"
+    sed "s|</project>|<properties><cucumber.version>$2</cucumber.version></properties></project>|" "$pom" > "$pom.new"
+    mv "$pom.new" "$pom"
 }
 
 run_bump() {
