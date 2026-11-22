@@ -23,7 +23,8 @@ spool/                  any name you like
 ├── dsl/
 ├── runtime/
 ├── watchdog/
-└── provisioning/
+├── provisioning/
+└── cli/
 ```
 
 ## Prerequisites
@@ -76,7 +77,7 @@ By default modules are installed into your local `~/.m2` and tests are skipped. 
 core ─┬─ crawler ──┐
       ├─ janitor ──┤
       ├─ mounter ──┼─> infrastructure ─> dsl ─┬─> runtime
-      │                                       └─> provisioning
+      │                                       └─> provisioning ─> cli
       └─ validator ─> ingester ─┘
 core ─> watchdog     (nothing depends on it)
 ```
@@ -84,11 +85,12 @@ core ─> watchdog     (nothing depends on it)
 | If you change | Also rebuild |
 |---|---|
 | `core` | every other module |
-| `crawler`, `janitor`, `mounter` | `infrastructure`, `dsl`, `runtime`, `provisioning` |
-| `validator` | `ingester`, `infrastructure`, `dsl`, `runtime`, `provisioning` |
-| `infrastructure` | `dsl`, `runtime`, `provisioning` |
-| `dsl` | `runtime`, `provisioning` |
-| `runtime`, `watchdog`, `provisioning` | nothing |
+| `crawler`, `janitor`, `mounter` | `infrastructure`, `dsl`, `runtime`, `provisioning`, `cli` |
+| `validator` | `ingester`, `infrastructure`, `dsl`, `runtime`, `provisioning`, `cli` |
+| `infrastructure` | `dsl`, `runtime`, `provisioning`, `cli` |
+| `dsl` | `runtime`, `provisioning`, `cli` |
+| `provisioning` | `cli` |
+| `runtime`, `watchdog`, `cli` | nothing |
 
 `./build.sh <module>` already does this for you.
 

@@ -28,5 +28,6 @@
         <module>../runtime</module>
         <module>../watchdog</module>
         <module>../provisioning</module>
+        <module>../cli</module>
     </modules>
 </project>
