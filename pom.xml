@@ -29,5 +29,6 @@
         <module>../watchdog</module>
         <module>../provisioning</module>
         <module>../cli</module>
+        <module>../api</module>
     </modules>
 </project>
