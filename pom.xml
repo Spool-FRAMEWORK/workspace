@@ -27,5 +27,6 @@
         <module>../dsl</module>
         <module>../runtime</module>
         <module>../watchdog</module>
+        <module>../provisioning</module>
     </modules>
 </project>
